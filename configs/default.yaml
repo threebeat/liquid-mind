@@ -1,0 +1,52 @@
+# Liquid-Mind default configuration.
+
+env:
+  arena_half_size: 5.0        # arena is a 10x10 m walled square
+  n_obstacles: 6
+  n_rays: 16
+  ray_length: 5.0
+  physics_hz: 240
+  control_substeps: 8         # nominal control at 240/8 = 30 Hz
+  substeps_min: 4             # irregular-dt mode: 15..60 Hz
+  substeps_max: 16
+  max_wheel_speed: 20.0       # rad/s (wheel radius 0.06 m -> ~1.2 m/s top speed)
+  goal_radius: 0.4
+  max_episode_steps: 600
+  reward:
+    progress_scale: 5.0
+    step_penalty: 0.005
+    collision_penalty: 0.5
+    success_bonus: 10.0
+
+agent:
+  snn_neurons: 32             # LIF neurons in the spiking encoder
+  snn_beta: 0.9               # membrane decay
+  lnn_units: 24               # liquid (CfC) neurons, AutoNCP wiring
+  latent_dim: 16              # world-model embedding size
+
+world_model:
+  chunk_steps: 15             # one macro-step ~ 0.5 s at nominal 30 Hz
+  hidden_dim: 64
+  ema_momentum: 0.995
+  lr: 0.001
+  batch_size: 256
+  train_steps: 3000
+  collect_episodes: 80
+
+planner:
+  horizon: 4                  # plan 4 chunks (~2 s) ahead
+  population: 64
+  elites: 8
+  iterations: 3
+  goal_tau: 0.4               # seconds; subgoal glides toward planner target
+                              # via dg/dt = (1/tau)(z_target - g). Smooths the
+                              # ~2 Hz planner output into a continuous signal.
+
+training:
+  baseline_timesteps: 150000
+  baseline_n_envs: 4
+  cma_generations: 60
+  cma_population: 24
+  cma_sigma: 0.15
+  episodes_per_candidate: 2
+  workers: 4

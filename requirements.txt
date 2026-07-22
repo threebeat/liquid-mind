@@ -1,0 +1,12 @@
+# NOTE: pybullet has no prebuilt Windows wheel for modern Pythons, so this
+# project uses a local conda-forge environment in ./env (python 3.11 +
+# pybullet + numpy installed via micromamba). The packages below are pip-
+# installed into that same env:
+#   .\env\python.exe -m pip install -r requirements.txt
+torch
+gymnasium
+snntorch
+ncps
+stable-baselines3
+cmaes
+pyyaml
