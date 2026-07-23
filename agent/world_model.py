@@ -10,9 +10,12 @@ Loss = MSE(z', target) + a small variance hinge that keeps embedding
 dimensions from collapsing to a constant (the classic JEPA/BYOL failure mode;
 the EMA target does most of the anti-collapse work, the hinge is insurance).
 
-A supervised readout head maps latents to [goal distance, min ray distance]
-so the planner can score imagined futures for "closer to goal" and
-"about to hit something".
+A supervised readout head grounds the latent in control-relevant geometry:
+    [goal_dist, sin(bearing), cos(bearing),
+     min ray front, min ray left, min ray back, min ray right]
+Two scalars (distance + nearest wall) would be enough to score danger but
+too ambiguous to plan around it — "obstacle on the left" and "obstacle on
+the right" must map to different latents for a detour to be selectable.
 """
 import copy
 
@@ -30,6 +33,22 @@ def _mlp(sizes):
     return nn.Sequential(*layers)
 
 
+# ray indices per body quadrant (16 rays, index i at angle 2*pi*i/16,
+# 0 = straight ahead in the robot frame)
+_QUADRANTS = {"front": [14, 15, 0, 1], "left": [2, 3, 4, 5],
+              "back": [6, 7, 8, 9], "right": [10, 11, 12, 13]}
+READOUT_DIM = 7
+
+
+def readout_targets(obs: torch.Tensor) -> torch.Tensor:
+    """Ground-truth grounding signals, all extractable from the observation."""
+    rays = obs[:, :16]
+    cols = [obs[:, 16], obs[:, 17], obs[:, 18]]      # goal dist, sin/cos bearing
+    for idx in _QUADRANTS.values():
+        cols.append(rays[:, idx].min(dim=1).values)
+    return torch.stack(cols, dim=1)
+
+
 class WorldModel(nn.Module):
     def __init__(self, obs_dim: int, latent_dim: int = 16, action_dim: int = 2,
                  hidden: int = 64, ema_momentum: float = 0.995):
@@ -42,7 +61,7 @@ class WorldModel(nn.Module):
             prm.requires_grad_(False)
         # predictor input: latent + mean action over the chunk + chunk duration
         self.predictor = _mlp([latent_dim + action_dim + 1, hidden, latent_dim])
-        self.readout = _mlp([latent_dim, 32, 2])   # -> [goal_dist_norm, min_ray]
+        self.readout = _mlp([latent_dim, 32, READOUT_DIM])
 
     @torch.no_grad()
     def update_target(self):
@@ -70,14 +89,11 @@ class WorldModel(nn.Module):
         std = z.std(dim=0)
         var_loss = F.relu(0.1 - std).mean()
 
-        # supervised readout on ground-truth signals present in the obs
-        # obs[16] = goal_dist/10, min ray = min(obs[:16]).
+        # supervised readout on ground-truth signals present in the obs.
         # No detach: the task signal shapes the encoder, grounding the latent
         # space in operationally meaningful quantities (and fighting collapse
         # more directly than the variance hinge alone).
-        tgt_read = torch.stack([obs_t[:, 16], obs_t[:, :16].min(dim=1).values],
-                               dim=1)
-        read_loss = F.mse_loss(self.readout(z), tgt_read)
+        read_loss = F.mse_loss(self.readout(z), readout_targets(obs_t))
 
         return pred_loss + 0.5 * var_loss + read_loss, {
             "pred": pred_loss.item(), "var": var_loss.item(),

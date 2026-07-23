@@ -59,9 +59,17 @@ def collect(cfg: dict, episodes: int) -> ReplayBuffer:
 
 def evaluate_multistep(wm: WorldModel, buf: ReplayBuffer, chunk: int,
                        steps: int = 4) -> dict:
-    """Latent error rolling the predictor `steps` chunks ahead vs persistence."""
+    """Multi-step prediction quality on held-out data.
+
+    Two views:
+      - latent error vs the persistence baseline (assume nothing changes);
+      - goal-distance decode error in METERS: physical units don't move when
+        the latent coordinate system rescales, so this is the interpretable
+        adequacy gate for whether planning on this model makes sense.
+    """
     rng = np.random.default_rng(1)
     errs, base = [], []
+    gd_errs, gd_base = [], []
     with torch.no_grad():
         for _ in range(200):
             e = buf.episodes[rng.integers(len(buf.episodes))]
@@ -73,17 +81,28 @@ def evaluate_multistep(wm: WorldModel, buf: ReplayBuffer, chunk: int,
             z0 = z.clone()
             for k in range(steps):
                 lo = t + k * chunk
-                a = torch.from_numpy(
-                    e["actions"][lo:lo + chunk].mean(axis=0, keepdims=True))
-                d = torch.tensor([[e["dts"][lo:lo + chunk].sum()]])
-                z = wm.predict_next(z, a.float(), d)
-            z_true = wm.target_encoder(
-                torch.from_numpy(e["obs"][t + chunk * steps:t + chunk * steps + 1]))
+                a = e["actions"][lo:lo + chunk]
+                d = e["dts"][lo:lo + chunk]
+                # duration-weighted mean: MUST match ReplayBuffer.sample_chunks
+                a_w = (a * d[:, None]).sum(axis=0) / d.sum()
+                z = wm.predict_next(
+                    z, torch.from_numpy(a_w[None]).float(),
+                    torch.tensor([[float(d.sum())]]))
+            obs_true = e["obs"][t + chunk * steps:t + chunk * steps + 1]
+            z_true = wm.target_encoder(torch.from_numpy(obs_true))
             errs.append(float(torch.norm(z - z_true)))
             base.append(float(torch.norm(z0 - z_true)))
+            # physical-units check: decode goal distance (obs[16] = dist/10 m)
+            gd_true = float(obs_true[0, 16]) * 10.0
+            gd_pred = float(wm.readout(z)[0, 0]) * 10.0
+            gd_now = float(e["obs"][t, 16]) * 10.0
+            gd_errs.append(abs(gd_pred - gd_true))
+            gd_base.append(abs(gd_now - gd_true))
     return {"pred_err": float(np.mean(errs)),
             "persistence_err": float(np.mean(base)),
-            "ratio": float(np.mean(errs) / (np.mean(base) + 1e-8))}
+            "ratio": float(np.mean(errs) / (np.mean(base) + 1e-8)),
+            "goal_dist_err_m": float(np.mean(gd_errs)),
+            "goal_dist_persistence_m": float(np.mean(gd_base))}
 
 
 def train(config: dict | None = None):
@@ -132,10 +151,14 @@ def train(config: dict | None = None):
     torch.save(wm.state_dict(), path)
     metrics = evaluate_multistep(wm, heldout, chunk)
     print(f"[wm] saved {path}")
-    print(f"[wm] 4-chunk latent error: {metrics['pred_err']:.4f} "
+    print(f"[wm] held-out 4-chunk latent error: {metrics['pred_err']:.4f} "
           f"(persistence baseline {metrics['persistence_err']:.4f}, "
           f"ratio {metrics['ratio']:.2f} — below 1.0 means the model "
           f"predicts better than assuming nothing changes)")
+    print(f"[wm] goal-distance decode after 4 imagined chunks: "
+          f"{metrics['goal_dist_err_m']:.2f} m error "
+          f"(persistence {metrics['goal_dist_persistence_m']:.2f} m). "
+          f"Planning is only justified if the model beats persistence here.")
     return metrics
 
 

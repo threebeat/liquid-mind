@@ -114,8 +114,8 @@ def train(generations: int | None = None, hierarchical: bool = False,
 
     opt = SepCMA(mean=x0.astype(np.float64), sigma=float(tr["cma_sigma"]),
                  population_size=popsize)
-    out_name = "hier_policy.pt" if hierarchical else "liquid_policy.pt"
-    out_path = os.path.join(MODELS_DIR, out_name)
+    stem = "hier_policy" if hierarchical else "liquid_policy"
+    out_path = os.path.join(MODELS_DIR, stem + template.variant_tag() + ".pt")
 
     pool = None
     if workers > 1:

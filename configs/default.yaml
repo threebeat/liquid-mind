@@ -12,7 +12,6 @@ env:
   episode_seconds: 20.0       # truncate on simulated time, not decision count
   max_wheel_speed: 20.0       # rad/s (wheel radius 0.06 m -> ~1.2 m/s top speed)
   goal_radius: 0.4
-  max_episode_steps: 600
   reward:
     progress_scale: 5.0
     step_penalty: 0.005       # per *nominal* step; scaled by dt so the
@@ -27,6 +26,9 @@ agent:
   lnn_units: 24               # liquid (CfC) neurons, AutoNCP wiring
   latent_dim: 16              # world-model embedding size
   policy_input: spikes_obs    # spikes_obs | spikes_only | obs_only (ablation)
+  snn_time_aware: true        # false = fixed-step LIF (discrete-time control
+  cfc_time_aware: true        # arm of the ablation); false = CfC fed nominal
+                              # dt regardless of the true interval
 
 world_model:
   chunk_steps: 15             # one macro-step ~ 0.5 s at nominal 30 Hz

@@ -54,7 +54,7 @@ def run_liquid(cfg, smin, smax, episodes, seed0):
         rewards.append(total)
         successes += int(info["is_success"])
     env.close()
-    return float(np.mean(rewards)), successes / episodes
+    return np.asarray(rewards), successes
 
 
 def run_baseline(cfg, smin, smax, episodes, seed0):
@@ -73,10 +73,10 @@ def run_baseline(cfg, smin, smax, episodes, seed0):
         rewards.append(total)
         successes += int(info["is_success"])
     env.close()
-    return float(np.mean(rewards)), successes / episodes
+    return np.asarray(rewards), successes
 
 
-def main(episodes: int = 20):
+def main(episodes: int = 50):
     cfg = load_config()
     ensure_dirs()
     results = {}
@@ -84,14 +84,20 @@ def main(episodes: int = 20):
         results[name] = {}
         r_fixed = None
         for label, smin, smax in JITTER_LEVELS:
-            r, s = fn(cfg, smin, smax, episodes, 555_000)
+            rw, n_succ = fn(cfg, smin, smax, episodes, 555_000)
+            mean = float(rw.mean())
+            ci95 = float(1.96 * rw.std(ddof=1) / np.sqrt(len(rw)))
             if label == "fixed":
-                r_fixed = r
-            drop = (r_fixed - r) / (abs(r_fixed) + 1e-8) * 100
-            results[name][label] = {"reward": r, "success": s,
-                                    "drop_vs_fixed_pct": drop}
-            print(f"{name:14s} {label:6s}: R={r:7.2f} success={s:.0%} "
-                  f"drop={drop:.1f}%", flush=True)
+                r_fixed = mean
+            drop = (r_fixed - mean) / (abs(r_fixed) + 1e-8) * 100
+            results[name][label] = {
+                "reward_mean": mean, "reward_ci95": ci95,
+                "reward_median": float(np.median(rw)),
+                "successes": n_succ, "episodes": episodes,
+                "drop_vs_fixed_pct": drop}
+            print(f"{name:14s} {label:6s}: R={mean:7.2f} +/-{ci95:5.2f} "
+                  f"(median {np.median(rw):6.2f})  "
+                  f"success={n_succ}/{episodes}  drop={drop:.1f}%", flush=True)
     out = os.path.join(RESULTS_DIR, "dt_robustness.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)

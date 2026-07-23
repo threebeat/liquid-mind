@@ -44,8 +44,10 @@ class CEMPlanner:
                 z = self.wm.predict_next(z, actions[:, h, :], dt)
                 if h == 0:
                     first_z = z.clone()
-                read = self.wm.readout(z)          # [goal_dist_norm, min_ray]
-                penalty += torch.relu(0.08 - read[:, 1]) * 5.0   # wall proximity
+                # readout: [goal_dist, sin_b, cos_b, min ray per quadrant]
+                read = self.wm.readout(z)
+                min_ray = read[:, 3:].min(dim=1).values
+                penalty += torch.relu(0.08 - min_ray) * 5.0   # wall proximity
             goal_dist = self.wm.readout(z)[:, 0]
             score = -goal_dist - penalty
             elite_idx = torch.topk(score, self.elites).indices

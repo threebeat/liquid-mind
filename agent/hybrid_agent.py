@@ -31,6 +31,11 @@ class HybridAgent:
                                 float(a.get("snn_tau_mem", 0.15)))
         # what the policy sees (ablation switch): spikes, raw obs, or both
         self.policy_input = a.get("policy_input", "spikes_obs")
+        # discrete-time control arms: feed nominal dt instead of the true one
+        self.snn_time_aware = bool(a.get("snn_time_aware", True))
+        self.cfc_time_aware = bool(a.get("cfc_time_aware", True))
+        self.nominal_dt = (int(config["env"]["control_substeps"])
+                           / int(config["env"]["physics_hz"]))
         feat = {"spikes_obs": int(a["snn_neurons"]) + OBS_DIM,
                 "spikes_only": int(a["snn_neurons"]),
                 "obs_only": OBS_DIM}[self.policy_input]
@@ -65,8 +70,24 @@ class HybridAgent:
         self._t = 0
 
     def parameters(self):
-        """Evolvable parameters (SNN + policy), for CMA-ES."""
+        """Evolvable parameters for CMA-ES. In obs_only mode the SNN cannot
+        affect the action, so its parameters are excluded rather than letting
+        the optimizer waste dimensions on them."""
+        if self.policy_input == "obs_only":
+            return list(self.policy.parameters())
         return list(self.snn.parameters()) + list(self.policy.parameters())
+
+    def variant_tag(self) -> str:
+        """Short tag describing non-default ablation settings, used to keep
+        checkpoints from different configurations separate."""
+        parts = []
+        if self.policy_input != "spikes_obs":
+            parts.append(self.policy_input)
+        if not self.snn_time_aware:
+            parts.append("fixedsnn")
+        if not self.cfc_time_aware:
+            parts.append("fixedcfc")
+        return ("_" + "_".join(parts)) if parts else ""
 
     # ------------------------------------------------------------------ act
 
@@ -81,7 +102,8 @@ class HybridAgent:
             alpha = min(1.0, dt / self.goal_tau)
             self._subgoal = self._subgoal + alpha * (self._subgoal_target
                                                      - self._subgoal)
-        spk, self._mem = self.snn(x, self._mem, dt)
+        dt_snn = dt if self.snn_time_aware else self.nominal_dt
+        spk, self._mem = self.snn(x, self._mem, dt_snn)
         if self.policy_input == "spikes_obs":
             feats = torch.cat([spk, x], dim=1)
         elif self.policy_input == "spikes_only":
@@ -89,7 +111,8 @@ class HybridAgent:
         else:
             feats = x
         pol_in = torch.cat([feats, self._subgoal], dim=1)
-        action, self._hx = self.policy(pol_in, self._hx, dt)
+        dt_cfc = dt if self.cfc_time_aware else self.nominal_dt
+        action, self._hx = self.policy(pol_in, self._hx, dt_cfc)
         self._t += 1
         return action.squeeze(0).numpy()
 

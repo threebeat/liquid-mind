@@ -56,9 +56,12 @@ class NavEnv(gym.Env):
         self.substeps_max = int(cfg["substeps_max"])
         self.max_wheel_speed = float(cfg["max_wheel_speed"])
         self.goal_radius = float(cfg["goal_radius"])
-        self.max_episode_steps = int(cfg["max_episode_steps"])
         self.episode_seconds = float(cfg.get("episode_seconds", 20.0))
         self.nominal_dt = self.nominal_substeps / self.physics_hz
+        # safety cap sized so it can NEVER truncate before the time horizon,
+        # even if every interval lands at the fast end of the jitter range
+        min_dt = self.substeps_min / self.physics_hz
+        self.max_episode_steps = int(self.episode_seconds / min_dt) + 8
         self.rw = cfg["reward"]
 
         self.observation_space = spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
@@ -207,7 +210,10 @@ class NavEnv(gym.Env):
         reward -= float(self.rw["step_penalty"]) * (self._last_dt / self.nominal_dt)
         collided = self._in_collision()
         if collided:
-            reward -= float(self.rw["collision_penalty"])
+            # persistent contact is charged per unit of simulated time, so a
+            # controller polled more often doesn't pay more for the same crash
+            reward -= (float(self.rw["collision_penalty"])
+                       * (self._last_dt / self.nominal_dt))
         self._prev_goal_dist = dist
 
         terminated = bool(dist < self.goal_radius)

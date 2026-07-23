@@ -5,14 +5,28 @@ linear projection of the observation. The membrane state persists across
 control steps, so the encoder integrates the sensor stream over time and
 emits spikes when neurons cross threshold — an event-based code.
 
-Continuous-time membrane: the leak is computed from the *physical* elapsed
-time of each step, beta = exp(-dt / tau), with a learnable per-neuron time
-constant tau. A fixed per-call decay (like snnTorch's Leaky) would make the
-membrane dynamics depend on the sensor rate — at 60 Hz it would leak 4x
-slower per second than at 15 Hz — which defeats the point of a
-continuous-time agent. (Note: the hard threshold below is fine for CMA-ES,
-which never differentiates through it; gradient-based training would need a
-surrogate gradient here.)
+Continuous-time membrane: exact zero-order-hold solution of the LIF ODE
+    tau * dm/dt = -m + I
+over the elapsed interval dt:
+    m' = beta * m + (1 - beta) * I,   beta = exp(-dt / tau)
+with a learnable per-neuron time constant tau.
+
+BOTH factors matter. A fixed per-call decay (snnTorch's Leaky) makes the
+leak depend on the sensor rate; injecting the full current once per call
+(without the 1-beta factor) makes the equilibrium level scale like tau/dt,
+so a 60 Hz stream would spike ~4x as often as a 15 Hz stream for the same
+physical signal. With the ZOH form, spike rate per physical second is
+sampling-rate independent.
+
+Timing semantics (causal): dt is the time elapsed since the PREVIOUS
+observation — the interval the state must be integrated across to reach
+"now". The agent is never told how long its action will be held; it can't
+know that in an online system. Applying the newly received observation over
+the just-elapsed interval (rather than holding the previous one) is the
+standard convention for irregularly-sampled recurrent models (GRU-D, CfC).
+
+(The hard threshold is fine for CMA-ES, which never differentiates through
+it; gradient-based training would need a surrogate gradient here.)
 """
 import math
 
@@ -38,7 +52,7 @@ class SpikeEncoder(nn.Module):
         """x: (batch, in_dim) -> spikes (batch, n_neurons), new membrane."""
         tau = torch.exp(self.log_tau).clamp(min=1e-3)
         beta = torch.exp(-float(dt) / tau)            # physical-time leak
-        mem = beta * mem + self.fc(x)
+        mem = beta * mem + (1.0 - beta) * self.fc(x)  # exact ZOH integration
         spk = (mem >= self.threshold).float()
         mem = mem - spk * self.threshold              # soft reset
         return spk, mem
