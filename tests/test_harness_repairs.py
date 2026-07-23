@@ -634,6 +634,27 @@ def test_full_run_requires_five_seeds(monkeypatch):
     runner_main()                                 # dry-run, no exception
 
 
+def test_full_run_blocked_without_complete_smoke_manifest(tmp_path,
+                                                          monkeypatch):
+    """A non-smoke --run enforces the smoke-manifest completeness check
+    internally and aborts BEFORE writing any full manifest."""
+    import sys as _sys
+    import scripts.run_timing_factorial as rt
+
+    monkeypatch.setattr(rt, "discover_latest_manifest", lambda smoke: None)
+    monkeypatch.setattr(rt, "MODELS_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "manifest_path",
+                        lambda smoke=False, stamp=None:
+                        str(tmp_path / f"factorial_manifest_{stamp}.json"))
+    monkeypatch.setattr(_sys, "argv",
+                        ["run_timing_factorial.py", "--run", "--seeds", "5",
+                         "--stamp", "guardtest"])
+    with pytest.raises(SystemExit) as exc:
+        rt.main()
+    assert exc.value.code == 1
+    assert not (tmp_path / "factorial_manifest_guardtest.json").exists()
+
+
 def test_full_preflight_requires_complete_smoke_manifest(tmp_path,
                                                          monkeypatch):
     import scripts.run_timing_factorial as rt

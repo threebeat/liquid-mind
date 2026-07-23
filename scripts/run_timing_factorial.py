@@ -319,6 +319,20 @@ def main():
               "validate the plan).")
         return
 
+    if not args.smoke:
+        # Operational safeguard: a full --run enforces the SAME Gate C'
+        # smoke-manifest completeness requirement as full preflight, so the
+        # preflight step cannot be accidentally bypassed. Abort before any
+        # manifest is written.
+        guard_failures: list[str] = []
+        check_smoke_manifest_complete(guard_failures)
+        if guard_failures:
+            print("\n[factorial] full run BLOCKED — Gate C' smoke manifest "
+                  "incomplete or invalid:")
+            for f in guard_failures:
+                print(f"  - {f}")
+            sys.exit(1)
+
     from training.train_policy import train
     stamp = args.stamp or time.strftime("%Y%m%d_%H%M%S")
     man_path = manifest_path(smoke=args.smoke,
