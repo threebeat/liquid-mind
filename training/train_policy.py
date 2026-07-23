@@ -75,15 +75,16 @@ def _evaluate(args):
         obs, _ = _ENV.reset(seed=int(seed))
         _AGENT.reset()
         ep = 0.0
-        prev_ld = (_AGENT.latent_dist_to_subgoal(obs) if shaping else 0.0)
         done = False
         while not done:
             action = _AGENT.act(obs, _ENV._last_dt)
+            # measure shaping before/after the step against the SAME subgoal
+            # (act() may have just changed the target; comparing distances to
+            # different targets would reward the target moving, not the robot)
+            ld_before = (_AGENT.latent_dist_to_subgoal(obs) if shaping else 0.0)
             obs, r, term, trunc, _ = _ENV.step(action)
             if shaping:
-                ld = _AGENT.latent_dist_to_subgoal(obs)
-                r += 0.1 * (prev_ld - ld)
-                prev_ld = ld
+                r += 0.1 * (ld_before - _AGENT.latent_dist_to_subgoal(obs))
             ep += r
             done = term or trunc
         total += ep
@@ -141,7 +142,7 @@ def train(generations: int | None = None, hierarchical: bool = False,
             template.save(out_path)
         print(f"[cma] gen {gen + 1}/{generations}  "
               f"best_reward={-gen_best:.2f}  all_time={-best_fit:.2f}  "
-              f"({time.time() - t0:.0f}s)")
+              f"({time.time() - t0:.0f}s)", flush=True)
     if pool:
         pool.close()
         pool.join()

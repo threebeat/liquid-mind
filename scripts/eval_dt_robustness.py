@@ -1,12 +1,18 @@
-"""Phase 2c: the real-time claim, tested.
+"""Phase 2c: the real-time claim, tested — with the confounds controlled.
 
-Both agents were trained at a fixed 30 Hz control rate. Here we evaluate them
-while the sensor stream's timing is randomized (each step simulates a random
-number of physics substeps, 15-60 Hz). The MLP baseline sees dt only as one
-more input feature; the liquid CfC policy integrates it into its continuous-
-time dynamics. Prediction: the liquid agent degrades gracefully, the MLP
-degrades more.
+Both agents are trained at a fixed 30 Hz control rate and evaluated under
+increasing timing jitter. Design notes (deliberate, to keep the comparison
+fair):
+  - jitter substep ranges are centered on the nominal 8 substeps, so the MEAN
+    control rate is identical across conditions — only the variance changes;
+  - episodes truncate on simulated time and the step penalty is charged per
+    unit of simulated time, so all conditions face the same physical horizon
+    and reward rate;
+  - both agents see dt in the observation; the liquid agent additionally
+    integrates it into its continuous-time dynamics (CfC timespans + LIF
+    exp(-dt/tau) leak). That integration is the mechanism under test.
 """
+import copy
 import json
 import os
 import sys
@@ -19,9 +25,21 @@ from common import MODELS_DIR, RESULTS_DIR, ensure_dirs, load_config
 from agent.hybrid_agent import HybridAgent
 from environment.nav_env import NavEnv
 
+# (label, substeps_min, substeps_max) — all means equal the nominal 8
+JITTER_LEVELS = [("fixed", None, None), ("mild", 6, 10), ("strong", 4, 12)]
 
-def run_liquid(cfg, irregular, episodes, seed0):
-    env = NavEnv(cfg, irregular_dt=irregular)
+
+def _env_for(cfg, smin, smax):
+    if smin is None:
+        return NavEnv(cfg, irregular_dt=False)
+    c = copy.deepcopy(cfg)
+    c["env"]["substeps_min"] = smin
+    c["env"]["substeps_max"] = smax
+    return NavEnv(c, irregular_dt=True)
+
+
+def run_liquid(cfg, smin, smax, episodes, seed0):
+    env = _env_for(cfg, smin, smax)
     agent = HybridAgent(cfg, mode="reactive")
     agent.load(os.path.join(MODELS_DIR, "liquid_policy.pt"))
     rewards, successes = [], 0
@@ -39,9 +57,9 @@ def run_liquid(cfg, irregular, episodes, seed0):
     return float(np.mean(rewards)), successes / episodes
 
 
-def run_baseline(cfg, irregular, episodes, seed0):
+def run_baseline(cfg, smin, smax, episodes, seed0):
     from stable_baselines3 import PPO
-    env = NavEnv(cfg, irregular_dt=irregular)
+    env = _env_for(cfg, smin, smax)
     model = PPO.load(os.path.join(MODELS_DIR, "ppo_baseline.zip"))
     rewards, successes = [], 0
     for ep in range(episodes):
@@ -63,16 +81,17 @@ def main(episodes: int = 20):
     ensure_dirs()
     results = {}
     for name, fn in [("mlp_baseline", run_baseline), ("liquid", run_liquid)]:
-        r_fix, s_fix = fn(cfg, False, episodes, 555_000)
-        r_jit, s_jit = fn(cfg, True, episodes, 555_000)
-        drop = (r_fix - r_jit) / (abs(r_fix) + 1e-8) * 100
-        results[name] = {
-            "fixed_dt": {"reward": r_fix, "success": s_fix},
-            "irregular_dt": {"reward": r_jit, "success": s_jit},
-            "reward_drop_pct": drop}
-        print(f"{name:14s} fixed: R={r_fix:7.2f} success={s_fix:.0%}   "
-              f"irregular: R={r_jit:7.2f} success={s_jit:.0%}   "
-              f"drop={drop:.1f}%")
+        results[name] = {}
+        r_fixed = None
+        for label, smin, smax in JITTER_LEVELS:
+            r, s = fn(cfg, smin, smax, episodes, 555_000)
+            if label == "fixed":
+                r_fixed = r
+            drop = (r_fixed - r) / (abs(r_fixed) + 1e-8) * 100
+            results[name][label] = {"reward": r, "success": s,
+                                    "drop_vs_fixed_pct": drop}
+            print(f"{name:14s} {label:6s}: R={r:7.2f} success={s:.0%} "
+                  f"drop={drop:.1f}%", flush=True)
     out = os.path.join(RESULTS_DIR, "dt_robustness.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)

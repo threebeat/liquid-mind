@@ -7,22 +7,26 @@ env:
   ray_length: 5.0
   physics_hz: 240
   control_substeps: 8         # nominal control at 240/8 = 30 Hz
-  substeps_min: 4             # irregular-dt mode: 15..60 Hz
-  substeps_max: 16
+  substeps_min: 4             # irregular-dt mode: 20..60 Hz, mean matches the
+  substeps_max: 12            # nominal 8 substeps so only variance changes
+  episode_seconds: 20.0       # truncate on simulated time, not decision count
   max_wheel_speed: 20.0       # rad/s (wheel radius 0.06 m -> ~1.2 m/s top speed)
   goal_radius: 0.4
   max_episode_steps: 600
   reward:
     progress_scale: 5.0
-    step_penalty: 0.005
+    step_penalty: 0.005       # per *nominal* step; scaled by dt so the
+                              # penalty rate is per-second, not per-decision
     collision_penalty: 0.5
     success_bonus: 10.0
 
 agent:
   snn_neurons: 32             # LIF neurons in the spiking encoder
-  snn_beta: 0.9               # membrane decay
+  snn_tau_mem: 0.15           # initial membrane time constant (seconds);
+                              # per-neuron, learnable, leak = exp(-dt/tau)
   lnn_units: 24               # liquid (CfC) neurons, AutoNCP wiring
   latent_dim: 16              # world-model embedding size
+  policy_input: spikes_obs    # spikes_obs | spikes_only | obs_only (ablation)
 
 world_model:
   chunk_steps: 15             # one macro-step ~ 0.5 s at nominal 30 Hz

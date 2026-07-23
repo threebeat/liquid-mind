@@ -31,9 +31,13 @@ class ReplayBuffer:
         for _ in range(batch):
             e = usable[rng.integers(len(usable))]
             t = int(rng.integers(0, len(e["actions"]) - chunk))
+            a = e["actions"][t:t + chunk]
+            d = e["dts"][t:t + chunk]
             obs_t.append(e["obs"][t])
-            act_mean.append(e["actions"][t:t + chunk].mean(axis=0))
-            dt_sum.append([e["dts"][t:t + chunk].sum()])
+            # duration-weighted mean: a command held for 66 ms counts more
+            # than one held for 16 ms (matters under irregular timing)
+            act_mean.append((a * d[:, None]).sum(axis=0) / d.sum())
+            dt_sum.append([d.sum()])
             obs_next.append(e["obs"][t + chunk])
         return (np.array(obs_t), np.array(act_mean),
                 np.array(dt_sum, dtype=np.float32), np.array(obs_next))

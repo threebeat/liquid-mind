@@ -71,10 +71,13 @@ class WorldModel(nn.Module):
         var_loss = F.relu(0.1 - std).mean()
 
         # supervised readout on ground-truth signals present in the obs
-        # obs[16] = goal_dist/10, min ray = min(obs[:16])
+        # obs[16] = goal_dist/10, min ray = min(obs[:16]).
+        # No detach: the task signal shapes the encoder, grounding the latent
+        # space in operationally meaningful quantities (and fighting collapse
+        # more directly than the variance hinge alone).
         tgt_read = torch.stack([obs_t[:, 16], obs_t[:, :16].min(dim=1).values],
                                dim=1)
-        read_loss = F.mse_loss(self.readout(z.detach()), tgt_read)
+        read_loss = F.mse_loss(self.readout(z), tgt_read)
 
         return pred_loss + 0.5 * var_loss + read_loss, {
             "pred": pred_loss.item(), "var": var_loss.item(),

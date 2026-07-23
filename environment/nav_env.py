@@ -57,6 +57,8 @@ class NavEnv(gym.Env):
         self.max_wheel_speed = float(cfg["max_wheel_speed"])
         self.goal_radius = float(cfg["goal_radius"])
         self.max_episode_steps = int(cfg["max_episode_steps"])
+        self.episode_seconds = float(cfg.get("episode_seconds", 20.0))
+        self.nominal_dt = self.nominal_substeps / self.physics_hz
         self.rw = cfg["reward"]
 
         self.observation_space = spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
@@ -174,7 +176,8 @@ class NavEnv(gym.Env):
             0, -1, vis, [self.goal[0], self.goal[1], 0.02])
 
         self._step_count = 0
-        self._last_dt = self.nominal_substeps / self.physics_hz
+        self._sim_time = 0.0
+        self._last_dt = self.nominal_dt
         obs = self._observe()
         self._prev_goal_dist = self._goal_dist()
         return obs, {"goal_dist": self._prev_goal_dist}
@@ -192,13 +195,16 @@ class NavEnv(gym.Env):
         for _ in range(substeps):
             self._pb.stepSimulation()
         self._last_dt = substeps / self.physics_hz
+        self._sim_time += self._last_dt
         self._step_count += 1
 
         obs = self._observe()
         dist = self._goal_dist()
 
         reward = (self._prev_goal_dist - dist) * float(self.rw["progress_scale"])
-        reward -= float(self.rw["step_penalty"])
+        # penalty is per unit of *simulated time* so that agents stepped at
+        # different rates pay the same rate of time cost
+        reward -= float(self.rw["step_penalty"]) * (self._last_dt / self.nominal_dt)
         collided = self._in_collision()
         if collided:
             reward -= float(self.rw["collision_penalty"])
@@ -207,7 +213,10 @@ class NavEnv(gym.Env):
         terminated = bool(dist < self.goal_radius)
         if terminated:
             reward += float(self.rw["success_bonus"])
-        truncated = self._step_count >= self.max_episode_steps
+        # truncate on simulated time (physical horizon identical regardless of
+        # control rate); step cap is only a safety net
+        truncated = (self._sim_time >= self.episode_seconds
+                     or self._step_count >= self.max_episode_steps)
 
         info = {"goal_dist": dist, "collided": collided, "dt": self._last_dt,
                 "is_success": terminated}

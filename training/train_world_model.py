@@ -100,6 +100,16 @@ def train(config: dict | None = None):
         buf = collect(cfg, int(wcfg["collect_episodes"]))
         buf.save(buf_path)
 
+    # hold out 10% of episodes: the model is validated on trajectories it
+    # never fit, not on its own training data
+    n_hold = max(1, len(buf) // 10)
+    heldout = ReplayBuffer()
+    heldout.episodes = buf.episodes[:n_hold]
+    train_buf = ReplayBuffer()
+    train_buf.episodes = buf.episodes[n_hold:]
+    buf = train_buf
+    print(f"[wm] train {len(buf)} episodes, held out {n_hold}")
+
     wm = WorldModel(OBS_DIM, int(cfg["agent"]["latent_dim"]),
                     hidden=int(wcfg["hidden_dim"]),
                     ema_momentum=float(wcfg["ema_momentum"]))
@@ -120,7 +130,7 @@ def train(config: dict | None = None):
 
     path = os.path.join(MODELS_DIR, "world_model.pt")
     torch.save(wm.state_dict(), path)
-    metrics = evaluate_multistep(wm, buf, chunk)
+    metrics = evaluate_multistep(wm, heldout, chunk)
     print(f"[wm] saved {path}")
     print(f"[wm] 4-chunk latent error: {metrics['pred_err']:.4f} "
           f"(persistence baseline {metrics['persistence_err']:.4f}, "

@@ -33,6 +33,7 @@ class CEMPlanner:
         dt = torch.full((P, 1), self.chunk_dt)
 
         best_first_z = z0
+        best_score = -float("inf")
         for _ in range(self.iterations):
             actions = (mean.unsqueeze(0) + std.unsqueeze(0)
                        * torch.randn(P, H, A)).clamp(-1, 1)
@@ -51,5 +52,10 @@ class CEMPlanner:
             elite = actions[elite_idx]
             mean = elite.mean(dim=0)
             std = elite.std(dim=0) + 1e-3
-            best_first_z = first_z[elite_idx[0]:elite_idx[0] + 1]
+            # keep the best candidate seen across ALL iterations, not just
+            # whichever led the final iteration
+            it_best = float(score[elite_idx[0]])
+            if it_best > best_score:
+                best_score = it_best
+                best_first_z = first_z[elite_idx[0]:elite_idx[0] + 1]
         return best_first_z

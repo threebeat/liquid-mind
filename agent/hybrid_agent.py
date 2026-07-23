@@ -28,8 +28,13 @@ class HybridAgent:
         self.mode = mode
         self.latent_dim = int(a["latent_dim"])
         self.snn = SpikeEncoder(OBS_DIM, int(a["snn_neurons"]),
-                                float(a["snn_beta"]))
-        in_dim = int(a["snn_neurons"]) + OBS_DIM + self.latent_dim
+                                float(a.get("snn_tau_mem", 0.15)))
+        # what the policy sees (ablation switch): spikes, raw obs, or both
+        self.policy_input = a.get("policy_input", "spikes_obs")
+        feat = {"spikes_obs": int(a["snn_neurons"]) + OBS_DIM,
+                "spikes_only": int(a["snn_neurons"]),
+                "obs_only": OBS_DIM}[self.policy_input]
+        in_dim = feat + self.latent_dim
         self.policy = LiquidPolicy(in_dim, int(a["lnn_units"]), ACT_DIM)
         self.snn.eval()
         self.policy.eval()
@@ -76,8 +81,14 @@ class HybridAgent:
             alpha = min(1.0, dt / self.goal_tau)
             self._subgoal = self._subgoal + alpha * (self._subgoal_target
                                                      - self._subgoal)
-        spk, self._mem = self.snn(x, self._mem)
-        pol_in = torch.cat([spk, x, self._subgoal], dim=1)
+        spk, self._mem = self.snn(x, self._mem, dt)
+        if self.policy_input == "spikes_obs":
+            feats = torch.cat([spk, x], dim=1)
+        elif self.policy_input == "spikes_only":
+            feats = spk
+        else:
+            feats = x
+        pol_in = torch.cat([feats, self._subgoal], dim=1)
         action, self._hx = self.policy(pol_in, self._hx, dt)
         self._t += 1
         return action.squeeze(0).numpy()
