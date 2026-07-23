@@ -37,8 +37,12 @@ agent:
   lnn_units: 24               # liquid (CfC) neurons, AutoNCP wiring
   latent_dim: 16              # world-model embedding size
   policy_input: spikes_obs    # spikes_obs | spikes_only | obs_only (ablation)
-  use_input_adapter: true     # capacity matching: every policy_input mode is
-  adapter_dim: 32             # projected to this width before an identical CfC
+  use_input_adapter: true     # shared 54-d sensory bus (spikes|obs, zeros for
+  adapter_dim: 32             # absent modalities) + identical Linear(54, 32)
+                              # before the CfC. Equalizes adapter shapes /
+                              # shared downstream architecture — NOT total
+                              # evolvable parameter matching (obs_only still
+                              # excludes SNN params from CMA-ES).
   snn_time_aware: true        # false = fixed-step LIF (discrete-time control
   cfc_time_aware: true        # arm of the ablation); false = CfC fed nominal
                               # dt regardless of the true interval

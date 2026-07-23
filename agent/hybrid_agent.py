@@ -46,8 +46,18 @@ agent.mask_direct_dt (default true) replaces the raw dt observation channel
 (obs[21]) with its nominal value before ANY network sees it, so nominal-time
 ablation arms cannot condition on the true interval through the observation
 bypass. agent.use_input_adapter projects every policy_input mode through a
-learned linear adapter of fixed width before an identical CfC, so the
-sensory-mode ablation is capacity-matched.
+shared 54-d sensory bus (spikes || obs, absent modalities zero-filled) and
+an identical linear adapter before the CfC — fixed adapter shapes / shared
+downstream architecture, not total-parameter capacity matching. obs_only
+still excludes SNN parameters from evolution.
+
+Physical-time planner scheduling
+--------------------------------
+The planner accumulates elapsed physical seconds and uses modulo to preserve
+residual time after a boundary. If one observation gap crosses multiple
+planning periods, the agent replans once at the first event following the
+missed boundaries and discards the count of missed opportunities through
+modulo — it does not retroactively replan at every elapsed boundary.
 """
 import os
 
@@ -64,6 +74,9 @@ from provenance import (SEMANTICS_VERSION, gather_provenance, load_checkpoint,
                         save_checkpoint)
 
 SUBGOAL_SOURCES = ("planner", "zero", "random", "shuffled", "heuristic")
+# Shared sensory bus: [spikes (n_neurons) | obs (OBS_DIM)]; absent slots zero.
+SENSORY_BUS_SPIKES = 32  # must match default snn_neurons; validated at init
+SENSORY_BUS_DIM = SENSORY_BUS_SPIKES + OBS_DIM  # 54
 
 
 class HybridAgent:
@@ -88,18 +101,27 @@ class HybridAgent:
         assert self.timing_convention in ("causal", "irnn")
         self.nominal_dt = (int(config["env"]["control_substeps"])
                            / int(config["env"]["physics_hz"]))
-        feat = {"spikes_obs": int(a["snn_neurons"]) + OBS_DIM,
-                "spikes_only": int(a["snn_neurons"]),
-                "obs_only": OBS_DIM}[self.policy_input]
-        # capacity matching: every sensory mode is projected to the same
-        # width before an identical CfC
+        # Shared downstream architecture: every mode fills a fixed 54-d bus
+        # (spikes | obs) with zeros for absent modalities, then an identical
+        # Linear(54, adapter_dim). This equalizes adapter tensor shapes, not
+        # total evolvable parameter count (obs_only still drops SNN params).
         self.use_input_adapter = bool(a.get("use_input_adapter", True))
         self.adapter_dim = int(a.get("adapter_dim", 32))
+        self.sensory_bus_dim = SENSORY_BUS_DIM
+        n_spikes = int(a["snn_neurons"])
+        if self.use_input_adapter and n_spikes != SENSORY_BUS_SPIKES:
+            raise ValueError(
+                f"use_input_adapter requires snn_neurons={SENSORY_BUS_SPIKES} "
+                f"(got {n_spikes}) so every mode shares a {SENSORY_BUS_DIM}-d "
+                f"sensory bus")
         if self.use_input_adapter:
-            self.adapter = nn.Linear(feat, self.adapter_dim)
+            self.adapter = nn.Linear(SENSORY_BUS_DIM, self.adapter_dim)
             in_dim = self.adapter_dim + self.latent_dim
         else:
             self.adapter = None
+            feat = {"spikes_obs": n_spikes + OBS_DIM,
+                    "spikes_only": n_spikes,
+                    "obs_only": OBS_DIM}[self.policy_input]
             in_dim = feat + self.latent_dim
         self.policy = LiquidPolicy(in_dim, int(a["lnn_units"]), ACT_DIM)
         self.snn.eval()
@@ -199,6 +221,8 @@ class HybridAgent:
             "timing_convention": self.timing_convention,
             "use_input_adapter": self.use_input_adapter,
             "adapter_dim": self.adapter_dim if self.use_input_adapter else None,
+            "sensory_bus_dim": (self.sensory_bus_dim
+                               if self.use_input_adapter else None),
             "snn_neurons": int(self.snn.n_neurons),
             "lnn_units": int(self.policy.units),
             "latent_dim": self.latent_dim,
@@ -246,18 +270,30 @@ class HybridAgent:
             self.advance(dt_eff)      # ... the already-elapsed interval
         return self._act(dt_eff)
 
+    def _sensory_bus(self, spikes: torch.Tensor, obs: torch.Tensor
+                     ) -> torch.Tensor:
+        """Fill the shared [spikes | obs] bus; zero absent modalities."""
+        B = obs.shape[0]
+        bus = torch.zeros(B, SENSORY_BUS_DIM, dtype=obs.dtype, device=obs.device)
+        if self.policy_input in ("spikes_obs", "spikes_only"):
+            bus[:, :spikes.shape[1]] = spikes
+        if self.policy_input in ("spikes_obs", "obs_only"):
+            bus[:, SENSORY_BUS_SPIKES:SENSORY_BUS_SPIKES + OBS_DIM] = obs
+        return bus
+
     def _act(self, dt: float) -> np.ndarray:
         x = self._held_x
         if self.mode == "hierarchical":
             self._update_subgoal(x, dt)
-        if self.policy_input == "spikes_obs":
+        if self.adapter is not None:
+            feats = torch.tanh(self.adapter(
+                self._sensory_bus(self._pending_feats, x)))
+        elif self.policy_input == "spikes_obs":
             feats = torch.cat([self._pending_feats, x], dim=1)
         elif self.policy_input == "spikes_only":
             feats = self._pending_feats
         else:
             feats = x
-        if self.adapter is not None:
-            feats = torch.tanh(self.adapter(feats))
         pol_in = torch.cat([feats, self._subgoal], dim=1)
         dt_cfc = dt if self.cfc_time_aware else self.nominal_dt
         action, self._hx = self.policy(pol_in, self._hx, dt_cfc)
@@ -268,7 +304,11 @@ class HybridAgent:
 
     def _update_subgoal(self, x: torch.Tensor, dt: float):
         """Physical-time replanning: replan every plan_period SECONDS of
-        elapsed time (residual carried over so the clock never drifts)."""
+        elapsed time (residual carried over so the clock never drifts).
+
+        If a single observation gap crosses one or more planning periods,
+        replan once at the first subsequent event; missed interior boundaries
+        are discarded via modulo (no retroactive multi-replan)."""
         if self._time_since_plan is None:          # first event after reset
             replan = True
             self._time_since_plan = 0.0
@@ -307,14 +347,15 @@ class HybridAgent:
             return self.planner.plan(z_now)
         realized = self.wm.readout(z_now).squeeze(0).numpy().tolist()
         entry = {"t": self._t, "sim_time": self._sim_time,
-                 "realized_readout": realized}
+                 "realized_readout": realized,
+                 "planner_seed": self.planner.last_seed}
         if self._last_pred_readouts is not None:
             # prediction made one macro-step ago for "now" (first chunk)
             entry["prev_predicted_readout"] = self._last_pred_readouts[0]
         sub, info = self.planner.plan(z_now, return_info=True)
         entry.update({k: info[k] for k in ("best_score", "score_mean",
                                            "score_std", "score_min",
-                                           "score_max")})
+                                           "score_max", "planner_seed")})
         entry["chosen_subgoal"] = sub.squeeze(0).numpy().tolist()
         entry["predicted_readouts"] = info["predicted_readouts"]
         self._last_pred_readouts = info["predicted_readouts"]

@@ -98,3 +98,39 @@ def test_checkpoint_ref(tmp_path):
     assert ref["sha256"] == file_checksum(path)
     assert ref["experiment"] == "unit_test"
     assert ref["legacy"] is False
+
+
+def test_state_checksum_verified_on_load(tmp_path):
+    from provenance import state_checksum
+    path = str(tmp_path / "ck.pt")
+    state = _state()
+    save_checkpoint(path, state, _meta(), COMPAT)
+    # Tamper with weights while keeping recorded checksum
+    payload = torch.load(path, weights_only=True)
+    payload["state"]["w"] = payload["state"]["w"] + 1.0
+    torch.save(payload, path)
+    with pytest.raises(ValueError) as e:
+        load_checkpoint(path, expected_compat=COMPAT)
+    assert "state_checksum" in str(e.value)
+
+
+def test_state_checksum_canonical_stable():
+    from provenance import state_checksum
+    s = {"a": {"w": torch.arange(4.0)}, "b": torch.ones(2, 3)}
+    assert state_checksum(s) == state_checksum(s)
+    s2 = {"b": torch.ones(2, 3), "a": {"w": torch.arange(4.0)}}
+    assert state_checksum(s) == state_checksum(s2)
+
+
+def test_missing_checksum_requires_legacy(tmp_path):
+    path = str(tmp_path / "old.pt")
+    payload = {"state": _state(), "meta": {**_meta(), "compat": COMPAT}}
+    # deliberately omit state_checksum
+    payload["meta"].pop("state_checksum", None)
+    torch.save(payload, path)
+    with pytest.raises(ValueError) as e:
+        load_checkpoint(path, expected_compat=COMPAT)
+    assert "state_checksum" in str(e.value)
+    state, meta = load_checkpoint(path, expected_compat=COMPAT,
+                                  allow_legacy=True)
+    assert torch.equal(state["w"], _state()["w"])

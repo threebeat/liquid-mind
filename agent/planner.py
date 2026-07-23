@@ -5,6 +5,9 @@ the world model's latent dynamics, scores the imagined end states with the
 readout head (get close to the goal, don't end up near a wall), and returns
 the *latent state one chunk ahead* on the best plan. That latent is the
 subgoal handed to the fast liquid policy.
+
+Candidate sampling uses an explicit torch.Generator (never the global RNG)
+so recorded planner seeds fully determine CEM stochasticity.
 """
 import numpy as np
 import torch
@@ -23,6 +26,14 @@ class CEMPlanner:
         self.iterations = iterations
         self.chunk_dt = chunk_dt
         self.action_dim = action_dim
+        self.generator = torch.Generator()
+        self.last_seed: int | None = None
+
+    def seed(self, seed: int) -> None:
+        """Seed the planner's private Generator for reproducible CEM."""
+        seed = int(seed)
+        self.generator.manual_seed(seed)
+        self.last_seed = seed
 
     @torch.no_grad()
     def plan(self, z0: torch.Tensor, return_info: bool = False):
@@ -43,8 +54,8 @@ class CEMPlanner:
         best_traj = None
         last_scores = None
         for _ in range(self.iterations):
-            actions = (mean.unsqueeze(0) + std.unsqueeze(0)
-                       * torch.randn(P, H, A)).clamp(-1, 1)
+            noise = torch.randn(P, H, A, generator=self.generator)
+            actions = (mean.unsqueeze(0) + std.unsqueeze(0) * noise).clamp(-1, 1)
             z = z0.expand(P, -1)
             penalty = torch.zeros(P)
             zs = []
@@ -81,5 +92,6 @@ class CEMPlanner:
             "score_max": float(last_scores.max()),
             "chunk_dt": self.chunk_dt,
             "predicted_readouts": pred_readouts.numpy().tolist(),
+            "planner_seed": self.last_seed,
         }
         return best_first_z, info

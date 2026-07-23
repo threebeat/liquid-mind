@@ -95,13 +95,24 @@ def test_nominal_time_arms_use_nominal_dt():
 
 
 def test_capacity_matching_across_input_modes():
-    """Every policy_input mode feeds an identical CfC through a fixed-width
-    adapter: the policy parameter shapes must be identical."""
-    shapes = {}
+    """Every policy_input mode uses the same 54→32 adapter and identical CfC
+    parameter shapes (shared downstream architecture)."""
+    adapter_shapes = {}
+    policy_shapes = {}
     for mode in ("spikes_obs", "spikes_only", "obs_only"):
         a = make_agent(policy_input=mode, use_input_adapter=True)
-        shapes[mode] = [tuple(p.shape) for p in a.policy.parameters()]
-    assert shapes["spikes_obs"] == shapes["spikes_only"] == shapes["obs_only"]
+        assert a.adapter.in_features == 54
+        assert a.adapter.out_features == 32
+        adapter_shapes[mode] = [tuple(p.shape) for p in a.adapter.parameters()]
+        policy_shapes[mode] = [tuple(p.shape) for p in a.policy.parameters()]
+    assert adapter_shapes["spikes_obs"] == adapter_shapes["spikes_only"] \
+        == adapter_shapes["obs_only"]
+    assert policy_shapes["spikes_obs"] == policy_shapes["spikes_only"] \
+        == policy_shapes["obs_only"]
+    # Active evolvable counts still differ (obs_only drops SNN)
+    n_obs = make_agent(policy_input="obs_only").n_parameters()
+    n_both = make_agent(policy_input="spikes_obs").n_parameters()
+    assert n_both > n_obs
 
 
 def test_obs_only_excludes_snn_parameters():

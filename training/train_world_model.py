@@ -10,12 +10,12 @@ will use it (Priority 7). The gate evaluates every grounded readout —
 goal distance (m), goal bearing (rad), and all four directional obstacle
 minima — at open-loop horizons of 0.5/1/2/4 s against:
   - a persistence baseline (assume nothing changes);
-  - a differential-drive kinematic baseline (integrate wheel commands for
+  - an exact differential-drive kinematic baseline (arc integration for
     goal distance/bearing; persistence for obstacle rays);
-plus a false-safe rate (model predicts clearance, reality is dangerous) and
-a left/right directional-confusion rate. The gate verdict is stored INSIDE
-the checkpoint metadata; downstream consumers refuse a failed or ungated
-model unless explicitly overridden.
+plus false-safe rate (undefined => incomplete, never passed), left/right
+confusion limits, episode-clustered effect sizes, and absolute usefulness
+bounds. Status is passed / failed / incomplete; downstream consumers refuse
+failed or incomplete models unless explicitly overridden.
 """
 import argparse
 import math
@@ -119,18 +119,31 @@ def _ang_err(a: float, b: float) -> float:
 
 def _kinematic_rollout(g0: dict, actions: np.ndarray, dts: np.ndarray,
                        max_wheel_speed: float) -> dict:
-    """Differential-drive constant-command baseline: integrate wheel
-    commands to predict goal distance/bearing; rays use persistence."""
+    """Exact differential-drive arc integration for goal distance/bearing.
+
+    For nonzero yaw rate uses the closed-form constant-(v,ω) arc; for ω≈0
+    falls back to pure translation. Obstacle rays use persistence.
+    """
     d, b = g0["goal_dist_m"], g0["bearing"]
     gx, gy = d * math.cos(b), d * math.sin(b)      # goal in robot frame
     for a, dt in zip(actions, dts):
+        dt = float(dt)
+        if dt <= 0:
+            continue
         vl = float(a[0]) * max_wheel_speed * WHEEL_RADIUS
         vr = float(a[1]) * max_wheel_speed * WHEEL_RADIUS
         v = 0.5 * (vl + vr)
         w = (vr - vl) / AXLE_TRACK
-        gx -= v * dt                                # robot moves forward
-        c, s = math.cos(-w * dt), math.sin(-w * dt)  # frame rotates
-        gx, gy = c * gx - s * gy, s * gx + c * gy
+        if abs(w) < 1e-9:
+            dx, dy, theta = v * dt, 0.0, 0.0
+        else:
+            theta = w * dt
+            dx = (v / w) * math.sin(theta)
+            dy = (v / w) * (1.0 - math.cos(theta))
+        # Express the fixed goal in the post-motion body frame
+        rx, ry = gx - dx, gy - dy
+        c, s = math.cos(theta), math.sin(theta)
+        gx, gy = c * rx + s * ry, -s * rx + c * ry
     return {"goal_dist_m": math.hypot(gx, gy),
             "bearing": math.atan2(gy, gx),
             "quads": dict(g0["quads"])}             # persistence for rays
@@ -141,15 +154,67 @@ def _kinematic_rollout(g0: dict, actions: np.ndarray, dts: np.ndarray,
 DANGER_TRUE = 0.08      # true min hit fraction below this = dangerous
 SAFE_PRED = 0.12        # predicted min above this = model calls it safe
 LR_MARGIN = 0.10        # only score L/R ordering when truth is decisive
+MIN_DANGER_CASES = 20   # undefined safety below this -> incomplete, not pass
+MIN_LR_CASES = 20
+MAX_LR_CONFUSION = 0.40
+# Planner-relevant effect sizes (goal_radius default 0.4 m)
+MIN_GOAL_IMPROVE_M = 0.05          # absolute MAE improvement vs persistence @2s
+MIN_GOAL_IMPROVE_REL = 0.10        # or 10% relative
+MAX_ABS_GOAL_MAE_2S = 0.40         # useful absolute error <= goal_radius
+KIN_EPS_M = 0.02                   # model must beat kin or be within ε while
+                                   # beating persistence
+MIN_BEAR_IMPROVE_RAD = 0.05
+
+
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> dict:
+    if n <= 0:
+        return {"point": None, "lo": None, "hi": None, "k": 0, "n": 0}
+    from scripts.eval_common import wilson_interval
+    return wilson_interval(k, n, z=z)
+
+
+def _clustered_mean_diff(model_errs, base_errs, episode_ids, n_boot=2000,
+                         seed=0) -> dict:
+    """Episode-clustered bootstrap CI on mean(base - model) improvement."""
+    model_errs = np.asarray(model_errs, dtype=np.float64)
+    base_errs = np.asarray(base_errs, dtype=np.float64)
+    episode_ids = np.asarray(episode_ids)
+    if len(model_errs) == 0:
+        return {"mean_diff": None, "lo": None, "hi": None,
+                "excludes_zero": False, "n": 0}
+    # group by episode
+    groups = {}
+    for i, ep in enumerate(episode_ids):
+        groups.setdefault(int(ep), []).append(i)
+    ep_keys = sorted(groups)
+    diffs = []
+    for ep in ep_keys:
+        idx = groups[ep]
+        diffs.append(float(np.mean(base_errs[idx] - model_errs[idx])))
+    diffs = np.asarray(diffs, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    boots = []
+    for _ in range(n_boot):
+        sample = rng.choice(diffs, size=len(diffs), replace=True)
+        boots.append(float(sample.mean()))
+    boots = np.asarray(boots)
+    lo, hi = float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+    return {"mean_diff": float(diffs.mean()), "lo": lo, "hi": hi,
+            "excludes_zero": bool(lo > 0 or hi < 0), "n_episodes": len(diffs),
+            "n_windows": int(len(model_errs))}
 
 
 def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                   cfg: dict, horizons=(0.5, 1.0, 2.0, 4.0),
                   n_windows: int = 300, seed: int = 1) -> dict:
     """Open-loop rollout evaluation of every grounded readout, against
-    persistence and kinematic baselines. Returns metrics + gate verdict."""
+    persistence and kinematic baselines. Returns metrics + gate verdict
+    with status in {passed, failed, incomplete}.
+    """
     rng = np.random.default_rng(seed)
     max_wheel = float(cfg["env"]["max_wheel_speed"])
+    goal_radius = float(cfg["env"].get("goal_radius", 0.4))
+    max_abs_goal = min(MAX_ABS_GOAL_MAE_2S, goal_radius)
     n_chunks_max = int(round(max(horizons) / chunk_seconds))
     h_chunks = {h: int(round(h / chunk_seconds)) for h in horizons}
 
@@ -157,6 +222,7 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                "bear": {"model": [], "persist": [], "kin": []},
                "quad": {"model": [], "persist": []},
                "danger_true": [], "pred_safe": [], "persist_safe": [],
+               "ep_ids": [],
                "lr_total": 0, "lr_wrong": 0}
            for h in horizons}
 
@@ -165,7 +231,8 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
     with torch.no_grad():
         while done_windows < n_windows and tried < n_windows * 20:
             tried += 1
-            e = buf.episodes[rng.integers(len(buf.episodes))]
+            ep_i = int(rng.integers(len(buf.episodes)))
+            e = buf.episodes[ep_i]
             T = len(e["actions"])
             if T < 4:
                 continue
@@ -205,6 +272,7 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                     kin = _kinematic_rollout(
                         g0, e["actions"][t0:hi], e["dts"][t0:hi], max_wheel)
                     a_ = acc[h]
+                    a_["ep_ids"].append(ep_i)
                     a_["goal"]["model"].append(
                         abs(pred["goal_dist_m"] - truth["goal_dist_m"]))
                     a_["goal"]["persist"].append(
@@ -237,18 +305,23 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                         a_["lr_total"] += 1
                         a_["lr_wrong"] += int(np.sign(p_lr) != np.sign(t_lr))
 
-    def _false_safe(danger, safe):
-        danger = np.asarray(danger)
-        safe = np.asarray(safe)
+    def _false_safe_stats(danger, safe):
+        danger = np.asarray(danger, dtype=bool)
+        safe = np.asarray(safe, dtype=bool)
         n_danger = int(danger.sum())
         if n_danger == 0:
-            return None
-        return float((danger & safe).sum() / n_danger)
+            return {"rate": None, "n_danger": 0, "n_false_safe": 0,
+                    "wilson": _wilson_ci(0, 0)}
+        n_fs = int((danger & safe).sum())
+        return {"rate": float(n_fs / n_danger), "n_danger": n_danger,
+                "n_false_safe": n_fs, "wilson": _wilson_ci(n_fs, n_danger)}
 
     metrics = {"n_windows": done_windows, "chunk_seconds": chunk_seconds,
-               "horizons": {}}
+               "horizons": {}, "effect_sizes": {}}
     for h in horizons:
         a_ = acc[h]
+        fs_m = _false_safe_stats(a_["danger_true"], a_["pred_safe"])
+        fs_p = _false_safe_stats(a_["danger_true"], a_["persist_safe"])
         metrics["horizons"][str(h)] = {
             "goal_dist_mae_m": {k: float(np.mean(v)) if v else None
                                 for k, v in a_["goal"].items()},
@@ -256,36 +329,143 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                                 for k, v in a_["bear"].items()},
             "quadrant_mae": {k: float(np.mean(v)) if v else None
                              for k, v in a_["quad"].items()},
-            "false_safe_rate": {
-                "model": _false_safe(a_["danger_true"], a_["pred_safe"]),
-                "persist": _false_safe(a_["danger_true"], a_["persist_safe"])},
+            "false_safe": {"model": fs_m, "persist": fs_p},
+            # keep legacy key for printers/tests
+            "false_safe_rate": {"model": fs_m["rate"],
+                                "persist": fs_p["rate"]},
             "lr_confusion_rate": (a_["lr_wrong"] / a_["lr_total"]
                                   if a_["lr_total"] else None),
             "lr_cases": a_["lr_total"],
+            "n_danger": fs_m["n_danger"],
+        }
+        metrics["effect_sizes"][str(h)] = {
+            "goal_vs_persist": _clustered_mean_diff(
+                a_["goal"]["model"], a_["goal"]["persist"], a_["ep_ids"],
+                seed=seed + int(h * 10)),
+            "goal_vs_kin": _clustered_mean_diff(
+                a_["goal"]["model"], a_["goal"]["kin"], a_["ep_ids"],
+                seed=seed + 100 + int(h * 10)),
+            "bear_vs_persist": _clustered_mean_diff(
+                a_["bear"]["model"], a_["bear"]["persist"], a_["ep_ids"],
+                seed=seed + 200 + int(h * 10)),
+            "bear_vs_kin": _clustered_mean_diff(
+                a_["bear"]["model"], a_["bear"]["kin"], a_["ep_ids"],
+                seed=seed + 300 + int(h * 10)),
+            "quad_vs_persist": _clustered_mean_diff(
+                a_["quad"]["model"], a_["quad"]["persist"], a_["ep_ids"],
+                seed=seed + 400 + int(h * 10)),
         }
 
     def _m(h, group, who):
         return metrics["horizons"][str(h)][group][who]
 
-    fs2 = metrics["horizons"]["2.0"]["false_safe_rate"]
+    h2 = metrics["horizons"]["2.0"]
+    es2 = metrics["effect_sizes"]["2.0"]
+    fs2 = h2["false_safe"]
+    n_danger = fs2["model"]["n_danger"]
+    incomplete_reasons = []
+
+    # --- safety: never pass when undefined ---
+    if n_danger < MIN_DANGER_CASES:
+        incomplete_reasons.append(
+            f"n_danger={n_danger} < MIN_DANGER_CASES={MIN_DANGER_CASES}")
+        false_safe_ok = None
+    else:
+        # model false-safe not worse than persistence (point estimate) and
+        # upper Wilson bound not catastrophic
+        m_rate, p_rate = fs2["model"]["rate"], fs2["persist"]["rate"]
+        false_safe_ok = bool(m_rate is not None and p_rate is not None
+                             and m_rate <= p_rate + 1e-9
+                             and fs2["model"]["wilson"]["hi"] is not None
+                             and fs2["model"]["wilson"]["hi"] <= 0.5)
+
+    lr_rate, lr_n = h2["lr_confusion_rate"], h2["lr_cases"]
+    if lr_n < MIN_LR_CASES:
+        incomplete_reasons.append(
+            f"lr_cases={lr_n} < MIN_LR_CASES={MIN_LR_CASES}")
+        lr_ok = None
+    else:
+        lr_ok = bool(lr_rate is not None and lr_rate <= MAX_LR_CONFUSION)
+
+    g_model = _m(2.0, "goal_dist_mae_m", "model")
+    g_persist = _m(2.0, "goal_dist_mae_m", "persist")
+    g_kin = _m(2.0, "goal_dist_mae_m", "kin")
+    if g_model is not None and g_persist is not None:
+        improve = g_persist - g_model
+    else:
+        improve = None
+    rel_ok = (improve is not None and g_persist > 1e-9
+              and improve / g_persist >= MIN_GOAL_IMPROVE_REL)
+    abs_ok = improve is not None and improve >= MIN_GOAL_IMPROVE_M
+    goal_persist_ok = bool(
+        g_model is not None and g_persist is not None
+        and (abs_ok or rel_ok)
+        and es2["goal_vs_persist"]["mean_diff"] is not None
+        and es2["goal_vs_persist"]["mean_diff"] > 0
+        and g_model <= max_abs_goal)
+
+    # Beat kinematic, or within ε of kin while clearly beating persistence
+    kin_ok = bool(
+        g_model is not None and g_kin is not None
+        and (g_model < g_kin - 1e-9
+             or (g_model <= g_kin + KIN_EPS_M and goal_persist_ok)))
+
+    b_model = _m(2.0, "bearing_mae_rad", "model")
+    b_persist = _m(2.0, "bearing_mae_rad", "persist")
+    b_kin = _m(2.0, "bearing_mae_rad", "kin")
+    bear_persist_ok = bool(
+        b_model is not None and b_persist is not None
+        and (b_persist - b_model) >= MIN_BEAR_IMPROVE_RAD
+        and es2["bear_vs_persist"]["mean_diff"] is not None
+        and es2["bear_vs_persist"]["mean_diff"] > 0)
+    bear_kin_ok = bool(
+        b_model is not None and b_kin is not None
+        and (b_model < b_kin - 1e-9 or b_model <= b_kin + 0.05))
+
+    q_ok = bool(
+        _m(2.0, "quadrant_mae", "model") is not None
+        and _m(2.0, "quadrant_mae", "persist") is not None
+        and _m(2.0, "quadrant_mae", "model")
+        < _m(2.0, "quadrant_mae", "persist")
+        and es2["quad_vs_persist"]["mean_diff"] is not None
+        and es2["quad_vs_persist"]["mean_diff"] > 0)
+
     criteria = {
-        "goal_beats_persistence_2s": _m(2.0, "goal_dist_mae_m", "model")
-                                     < _m(2.0, "goal_dist_mae_m", "persist"),
-        "goal_beats_persistence_4s": _m(4.0, "goal_dist_mae_m", "model")
-                                     < _m(4.0, "goal_dist_mae_m", "persist"),
-        "bearing_beats_persistence_2s": _m(2.0, "bearing_mae_rad", "model")
-                                        < _m(2.0, "bearing_mae_rad", "persist"),
-        "quad_beats_persistence_2s": _m(2.0, "quadrant_mae", "model")
-                                     < _m(2.0, "quadrant_mae", "persist"),
-        "false_safe_not_worse_2s": (fs2["model"] is None
-                                    or fs2["persist"] is None
-                                    or fs2["model"] <= fs2["persist"]),
-        "open_loop_stable": (_m(4.0, "goal_dist_mae_m", "model")
-                             <= 2.0 * _m(2.0, "goal_dist_mae_m", "model")
-                             + 1e-9),
+        "goal_beats_persistence_2s": goal_persist_ok,
+        "goal_beats_persistence_4s": (
+            _m(4.0, "goal_dist_mae_m", "model") is not None
+            and _m(4.0, "goal_dist_mae_m", "persist") is not None
+            and _m(4.0, "goal_dist_mae_m", "model")
+            < _m(4.0, "goal_dist_mae_m", "persist")),
+        "goal_beats_or_matches_kinematic_2s": kin_ok,
+        "bearing_beats_persistence_2s": bear_persist_ok,
+        "bearing_beats_or_matches_kinematic_2s": bear_kin_ok,
+        "quad_beats_persistence_2s": q_ok,
+        "false_safe_not_worse_2s": false_safe_ok,
+        "lr_confusion_ok_2s": lr_ok,
+        "open_loop_stable": (
+            _m(4.0, "goal_dist_mae_m", "model") is not None
+            and _m(2.0, "goal_dist_mae_m", "model") is not None
+            and _m(4.0, "goal_dist_mae_m", "model")
+            <= 2.0 * _m(2.0, "goal_dist_mae_m", "model") + 1e-9),
+        "abs_goal_mae_useful_2s": bool(
+            g_model is not None and g_model <= max_abs_goal),
     }
+    # Any None criterion => incomplete (never passed)
+    if any(v is None for v in criteria.values()) or incomplete_reasons:
+        status = "incomplete"
+        passed = False
+    elif all(bool(v) for v in criteria.values()):
+        status = "passed"
+        passed = True
+    else:
+        status = "failed"
+        passed = False
+
     metrics["criteria"] = criteria
-    metrics["passed"] = all(criteria.values())
+    metrics["incomplete_reasons"] = incomplete_reasons
+    metrics["status"] = status
+    metrics["passed"] = passed
     return metrics
 
 
@@ -293,7 +473,8 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
 
 
 def train(config: dict | None = None, force: bool = False,
-          experiment_name: str = "world_model"):
+          experiment_name: str = "world_model",
+          allow_legacy_buffer: bool = False):
     cfg = config or load_config()
     ensure_dirs()
     wcfg = cfg["world_model"]
@@ -304,20 +485,40 @@ def train(config: dict | None = None, force: bool = False,
             f"{path} already exists; refusing to overwrite an existing "
             f"world model. Re-run with --force to replace it.")
 
-    buf_path = os.path.join(DATA_DIR, "experience.npz")
+    policy_path = os.path.join(MODELS_DIR, "liquid_policy.pt")
+    policy_ref = (policy_path if os.path.exists(policy_path) else None)
+    buf_meta = ReplayBuffer.build_meta(
+        cfg, seed_range=(10_000, 10_000 + int(wcfg["collect_episodes"]) - 1),
+        policy_checkpoint=policy_ref)
+    buf_path = ReplayBuffer.fingerprint_name(buf_meta, DATA_DIR)
+    legacy_path = os.path.join(DATA_DIR, "experience.npz")
+    buffer_override = False
+
     if os.path.exists(buf_path):
-        buf = ReplayBuffer.load(buf_path)
-        print(f"[wm] loaded buffer: {len(buf)} episodes")
+        buf = ReplayBuffer.load(buf_path,
+                                allow_legacy_buffer=allow_legacy_buffer)
+        print(f"[wm] loaded buffer: {buf_path} ({len(buf)} episodes)")
+    elif os.path.exists(legacy_path):
+        # Old global name — only with explicit override
+        if not allow_legacy_buffer:
+            raise ValueError(
+                f"Found legacy {legacy_path} without provenance metadata. "
+                f"Re-collect (delete it) or pass --allow-legacy-buffer.")
+        buf = ReplayBuffer.load(legacy_path, allow_legacy_buffer=True)
+        buffer_override = True
+        print(f"[wm] loaded LEGACY buffer {legacy_path} "
+              f"(--allow-legacy-buffer); override will be recorded")
     else:
         buf = collect(cfg, int(wcfg["collect_episodes"]))
-        buf.save(buf_path)
+        buf.save(buf_path, meta=buf_meta)
+        print(f"[wm] collected and saved {buf_path}")
 
     # hold out 10% of episodes: the model is validated on trajectories it
     # never fit, not on its own training data
     n_hold = max(1, len(buf) // 10)
-    heldout = ReplayBuffer()
+    heldout = ReplayBuffer(meta=buf.meta)
     heldout.episodes = buf.episodes[:n_hold]
-    train_buf = ReplayBuffer()
+    train_buf = ReplayBuffer(meta=buf.meta)
     train_buf.episodes = buf.episodes[n_hold:]
     buf = train_buf
     print(f"[wm] train {len(buf)} episodes, held out {n_hold}")
@@ -344,13 +545,17 @@ def train(config: dict | None = None, force: bool = False,
 
     wm.eval()
     gate = evaluate_gate(wm, heldout, chunk_seconds, cfg)
+    used_buf = buf_path if os.path.exists(buf_path) else legacy_path
     meta = gather_provenance(
         cfg, experiment_name=experiment_name,
         extra={"gate": gate,
                "train_episodes": len(buf), "heldout_episodes": n_hold,
                "train_steps": steps,
-               "buffer": checkpoint_ref(buf_path) if os.path.exists(buf_path)
-               else None})
+               "buffer": checkpoint_ref(used_buf)
+               if os.path.exists(used_buf) else None,
+               "allow_legacy_buffer": bool(buffer_override
+                                           or allow_legacy_buffer),
+               "buffer_meta": getattr(heldout, "meta", None)})
     save_checkpoint(path, wm.state_dict(), meta, wm_compat(cfg), force=force)
     print(f"[wm] saved {path}")
     _print_gate(gate)
@@ -367,11 +572,16 @@ def _print_gate(gate: dict):
               f"(persist {g['persist']:.3f}, kin {g['kin']:.3f}) | "
               f"bearing {b['model']:.3f} rad (persist {b['persist']:.3f}) | "
               f"quad {q['model']:.3f} (persist {q['persist']:.3f}) | "
-              f"false-safe {fs['model']} vs {fs['persist']} | "
+              f"false-safe {fs['model']} vs {fs['persist']} "
+              f"(n_danger={m.get('n_danger')}) | "
               f"L/R confusion {m['lr_confusion_rate']}")
-    verdict = "PASSED" if gate["passed"] else "FAILED"
-    print(f"[wm] gate {verdict}: " + ", ".join(
-        f"{k}={'ok' if v else 'FAIL'}" for k, v in gate["criteria"].items()))
+    status = gate.get("status", "passed" if gate.get("passed") else "failed")
+    print(f"[wm] gate status={status.upper()} (passed={gate['passed']}): "
+          + ", ".join(f"{k}={'ok' if v else ('incomplete' if v is None else 'FAIL')}"
+                      for k, v in gate["criteria"].items()))
+    if gate.get("incomplete_reasons"):
+        print("[wm] incomplete reasons: "
+              + "; ".join(gate["incomplete_reasons"]))
     if not gate["passed"]:
         print("[wm] hierarchical training/evaluation will refuse this model "
               "unless --override-wm-gate is given.")
@@ -383,21 +593,32 @@ def _print_gate(gate: dict):
 def load_world_model(cfg: dict, path: str | None = None,
                      override_gate: bool = False, allow_legacy: bool = False):
     """Load a world model, enforcing the planning gate (Priority 7).
-    Returns (wm, meta). Refuses failed/ungated models unless overridden."""
+    Returns (wm, meta). Refuses failed/incomplete/ungated models unless
+    overridden."""
     from provenance import load_checkpoint  # local import: avoids cycles
     path = path or os.path.join(MODELS_DIR, "world_model.pt")
     state, meta = load_checkpoint(path, expected_compat=wm_compat(cfg),
                                   allow_legacy=allow_legacy)
     gate = meta.get("gate")
-    if gate is None or not gate.get("passed", False):
-        status = "has no recorded planning gate" if gate is None \
-            else "FAILED its planning gate"
+    status = None
+    if isinstance(gate, dict):
+        status = gate.get("status")
+        passed = bool(gate.get("passed", False)) and status != "incomplete"
+    else:
+        passed = False
+    if gate is None or not passed:
+        if gate is None:
+            detail = "has no recorded planning gate"
+        elif status == "incomplete":
+            detail = "has an INCOMPLETE planning gate"
+        else:
+            detail = "FAILED its planning gate"
         if not override_gate:
             raise ValueError(
-                f"world model {path} {status}. Planning on an unvalidated "
+                f"world model {path} {detail}. Planning on an unvalidated "
                 f"model is disabled; retrain the model or pass "
                 f"--override-wm-gate for explicit diagnostics only.")
-        print(f"[wm] WARNING: using a world model that {status} "
+        print(f"[wm] WARNING: using a world model that {detail} "
               f"(--override-wm-gate).")
     wm = WorldModel(OBS_DIM, int(cfg["agent"]["latent_dim"]),
                     hidden=int(cfg["world_model"]["hidden_dim"]))
@@ -410,5 +631,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing world_model.pt")
+    ap.add_argument("--allow-legacy-buffer", action="store_true",
+                    help="permit pre-provenance experience.npz reuse")
     a = ap.parse_args()
-    train(force=a.force)
+    train(force=a.force, allow_legacy_buffer=a.allow_legacy_buffer)

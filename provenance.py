@@ -4,13 +4,15 @@ Every checkpoint and result produced by this project records where it came
 from: git commit, dirty state, fully resolved configuration, seeds, package
 versions, parameter counts and the timing distribution it was trained /
 evaluated under. Checkpoints carry a compatibility block that is validated
-on load, so a stale artifact can never be silently reused after the
-environment, observation, reward, model or timing semantics change.
+on load. Provenance currently covers agent/world-model `.pt` checkpoints and
+(from semantics_version 3) fingerprinted replay buffers; Stable-Baselines
+PPO zips and pre-v3 experience.npz files still need explicit legacy paths.
 
 Conventions:
   - A checkpoint file is a single .pt containing {"state": ..., "meta": ...}.
     meta["compat"] holds the keys that must match the loading configuration;
-    meta["state_checksum"] is a SHA-256 over the serialized state.
+    meta["state_checksum"] is a SHA-256 over a canonical tensor encoding
+    (sorted names + dtype/shape + contiguous bytes) and is verified on load.
   - Legacy (pre-provenance) artifacts are wrapped via import_legacy_checkpoint
     and marked meta["legacy"] = True. They load only when the caller passes
     allow_legacy=True, so they cannot be mistaken for new experiments.
@@ -19,7 +21,6 @@ Conventions:
 """
 import copy
 import hashlib
-import io
 import json
 import os
 import platform
@@ -38,7 +39,9 @@ from common import RESULTS_DIR, ROOT
 #      horizon overshoot, raw dt in obs consumed unmasked).
 #   2: event-count LIF, causal timing convention, per-substep collision
 #      integration, exact physical horizon, dt masking, input adapters.
-SEMANTICS_VERSION = 2
+#   3: shared 54-d sensory bus adapters, replay-buffer provenance,
+#      verified state checksums, strengthened WM/hierarchy gates.
+SEMANTICS_VERSION = 3
 
 _PACKAGES = ("torch", "numpy", "gymnasium", "ncps", "cmaes",
              "stable_baselines3", "pybullet", "yaml")
@@ -107,10 +110,41 @@ def gather_provenance(config: dict, experiment_name: str, variant: str = "",
 # ---------------------------------------------------------------- checksums
 
 
+def _flatten_tensors(obj, prefix: str = "") -> list[tuple[str, torch.Tensor]]:
+    """Walk nested state dicts and collect (dotted_name, tensor) pairs."""
+    out = []
+    if isinstance(obj, torch.Tensor):
+        out.append((prefix or "tensor", obj))
+    elif isinstance(obj, dict):
+        for k in sorted(obj.keys(), key=str):
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.extend(_flatten_tensors(obj[k], key))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            key = f"{prefix}[{i}]"
+            out.extend(_flatten_tensors(v, key))
+    return out
+
+
 def state_checksum(state: dict) -> str:
-    buf = io.BytesIO()
-    torch.save(state, buf)
-    return hashlib.sha256(buf.getvalue()).hexdigest()
+    """SHA-256 over a canonical encoding of tensor contents.
+
+    Hashes sorted tensor names with dtype, shape, and raw contiguous bytes
+    rather than torch.save() output, so the digest is stable across library
+    versions that change pickle framing.
+    """
+    h = hashlib.sha256()
+    for name, tensor in _flatten_tensors(state):
+        t = tensor.detach().cpu().contiguous()
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(t.dtype).encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(tuple(t.shape)).encode("utf-8"))
+        h.update(b"\0")
+        h.update(t.numpy().tobytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def file_checksum(path: str) -> str:
@@ -172,6 +206,7 @@ def load_checkpoint(path: str, expected_compat: dict | None = None,
             f"`python main.py import-legacy` and load the imported copy "
             f"with allow_legacy=True.")
     meta = payload["meta"]
+    state = payload["state"]
     if meta.get("legacy", False):
         if not allow_legacy:
             raise ValueError(
@@ -179,7 +214,21 @@ def load_checkpoint(path: str, expected_compat: dict | None = None,
                 f"semantics_version {SEMANTICS_VERSION}). Its training "
                 f"semantics differ from the current code. Load it only "
                 f"deliberately, with allow_legacy=True.")
-        return payload["state"], meta
+        return state, meta
+    stored = meta.get("state_checksum")
+    if stored is None:
+        if not allow_legacy:
+            raise ValueError(
+                f"{path} has no state_checksum (pre-verification artifact). "
+                f"Re-save under the current provenance module, or load "
+                f"deliberately with allow_legacy=True.")
+    else:
+        actual_sum = state_checksum(state)
+        if actual_sum != stored:
+            raise ValueError(
+                f"checkpoint {path} failed state_checksum verification:\n"
+                f"  recorded={stored}\n  recomputed={actual_sum}\n"
+                f"The file may be corrupted or its weights were modified.")
     if expected_compat is not None:
         actual = meta.get("compat", {})
         diffs = {k: {"checkpoint": actual.get(k), "current": v}
@@ -194,7 +243,7 @@ def load_checkpoint(path: str, expected_compat: dict | None = None,
                 f"configuration:\n{lines}\n"
                 f"Either restore the matching config, retrain under the new "
                 f"semantics, or (for old artifacts) re-import as legacy.")
-    return payload["state"], meta
+    return state, meta
 
 
 def import_legacy_checkpoint(src: str, dst: str, note: str = "",

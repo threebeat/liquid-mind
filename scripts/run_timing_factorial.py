@@ -12,10 +12,13 @@ Enumerates the confound-free timing ablation:
 
 All cells share: the same environment semantics, the same training seed
 bank, common random numbers within each generation, a held-out validation
-seed bank for checkpoint selection, capacity-matched policy inputs (learned
-adapter of fixed width before an identical CfC), and equal optimizer
-budgets. Each cell can be trained with multiple independent seeds
-(--seeds N) for architecture-level claims.
+seed bank for checkpoint selection, a shared 54-d sensory bus + identical
+adapter shapes (fixed downstream architecture; not total-parameter matching),
+and equal optimizer budgets. Each cell can be trained with multiple
+independent seeds (--seeds N) for architecture-level claims.
+
+Writes a factorial manifest (models/factorial_manifest_*.json) that
+eval_dt_robustness.py consumes via --manifest / --all-factorial.
 
 Also registers (off by default) the "reactive_extra_budget" attribution
 control: the reactive policy given the same ADDITIONAL training budget the
@@ -31,10 +34,12 @@ import copy
 import itertools
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common import MODELS_DIR, load_config
+from common import MODELS_DIR, ensure_dirs, load_config
+from scripts.factorial_io import cell_entry, manifest_path, write_manifest
 
 
 def factorial_cells():
@@ -99,6 +104,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
+    ensure_dirs()
     cells = factorial_cells()
     if args.include_extra_reactive:
         cells.append(extra_reactive_cell())
@@ -128,21 +134,32 @@ def main():
         return
 
     from training.train_policy import train
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    man_path = manifest_path(smoke=args.smoke,
+                             stamp=None if args.smoke else stamp)
+    entries = []
     for cell, seed, exp in plans:
         ckpt = os.path.join(MODELS_DIR, exp + ".pt")
+        c = cell_config(cfg, cell, args.smoke, args.train_jitter)
         if os.path.exists(ckpt) and not args.force:
             print(f"[factorial] SKIP {exp}: checkpoint exists "
-                  f"(--force to retrain)")
-            continue
-        c = cell_config(cfg, cell, args.smoke, args.train_jitter)
-        print(f"\n[factorial] === training {exp} (seed {seed}) ===")
-        train(hierarchical=cell.get("hierarchical", False),
-              workers=args.workers, config=c, experiment_name=exp,
-              seed=seed, force=args.force,
-              warm_from=cell.get("warm_from"))
-    print("\n[factorial] done. Evaluate cells under the disturbance ladder "
-          "with scripts/eval_dt_robustness.py (point it at each checkpoint) "
-          "and report paired confidence intervals.")
+                  f"(--force to retrain); still recording in manifest")
+        else:
+            print(f"\n[factorial] === training {exp} (seed {seed}) ===")
+            train(hierarchical=cell.get("hierarchical", False),
+                  workers=args.workers, config=c, experiment_name=exp,
+                  seed=seed, force=args.force,
+                  warm_from=cell.get("warm_from"))
+        if os.path.exists(ckpt):
+            entries.append(cell_entry(cell, ckpt, seed, exp, args.smoke, c))
+            write_manifest(man_path, entries, smoke=args.smoke,
+                           meta={"updated": time.strftime("%Y-%m-%dT%H:%M:%S")})
+
+    write_manifest(man_path, entries, smoke=args.smoke)
+    print(f"\n[factorial] done. Manifest: {man_path}")
+    print("Evaluate with:\n"
+          f"  python scripts/eval_dt_robustness.py --manifest {man_path}\n"
+          "  python scripts/eval_dt_robustness.py --all-factorial")
 
 
 if __name__ == "__main__":

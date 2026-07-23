@@ -28,16 +28,20 @@ import numpy as np
 
 def run_episode(env, act_fn, reset_fn, seed: int,
                 planner_seed: int | None = None,
-                timing_seed: int | None = None) -> dict:
+                timing_seed: int | None = None,
+                planner=None) -> dict:
     """Run one episode and return the full per-episode record.
 
     act_fn(obs, dt) -> action; reset_fn() resets agent state.
     The environment's np_random drives both layout and timing; a distinct
     timing seed would require a separate stream (recorded for provenance
-    even while identical to the env seed)."""
-    import torch
-    if planner_seed is not None:
-        torch.manual_seed(planner_seed)
+    even while identical to the env seed).
+
+    If `planner` is a CEMPlanner (or object with .seed), it is seeded from
+    planner_seed via its private torch.Generator — not the global RNG.
+    """
+    if planner is not None and planner_seed is not None and hasattr(planner, "seed"):
+        planner.seed(int(planner_seed))
     obs, info = env.reset(seed=int(seed))
     reset_fn()
     start_dist = float(info["goal_dist"])
@@ -181,21 +185,92 @@ def summarize(records: list[dict]) -> dict:
     }
 
 
+def aggregate_by_env_seed(records: list[dict]) -> list[dict]:
+    """Collapse CEM repeats into one inferential unit per environment seed.
+
+    Numeric metrics are averaged; success becomes a rate in [0, 1] and a
+    binary majority vote (for McNemar). Within-seed reward variance is kept
+    when multiple repeats exist.
+    """
+    by_seed: dict[int, list[dict]] = {}
+    for r in records:
+        by_seed.setdefault(int(r["env_seed"]), []).append(r)
+    out = []
+    for seed in sorted(by_seed):
+        group = by_seed[seed]
+        rewards = [float(r["reward"]) for r in group]
+        successes = [float(bool(r["success"])) for r in group]
+        dists = [float(r["final_goal_dist"]) for r in group]
+        coll = [float(r["collision_duration"]) for r in group]
+        rate = float(np.mean(successes))
+        out.append({
+            "env_seed": seed,
+            "n_repeats": len(group),
+            "reward": float(np.mean(rewards)),
+            "reward_std_within": (float(np.std(rewards))
+                                  if len(rewards) > 1 else 0.0),
+            "success": rate >= 0.5,
+            "success_rate": rate,
+            "final_goal_dist": float(np.mean(dists)),
+            "collision_duration": float(np.mean(coll)),
+            "path_efficiency": float(np.mean(
+                [r["path_efficiency"] for r in group])),
+            "planner_seeds": [r.get("planner_seed") for r in group],
+            "cem_repeats": [r.get("cem_repeat") for r in group],
+        })
+    return out
+
+
+def within_env_planner_variance(records: list[dict]) -> dict:
+    """Report within-environment planner stochasticity when cem_repeats > 1."""
+    by_seed: dict[int, list[dict]] = {}
+    for r in records:
+        by_seed.setdefault(int(r["env_seed"]), []).append(r)
+    multi = [g for g in by_seed.values() if len(g) > 1]
+    if not multi:
+        return {"n_env_with_repeats": 0}
+    reward_stds = [float(np.std([r["reward"] for r in g])) for g in multi]
+    success_stds = [float(np.std([float(r["success"]) for r in g]))
+                    for g in multi]
+    return {
+        "n_env_with_repeats": len(multi),
+        "mean_within_env_reward_std": float(np.mean(reward_stds)),
+        "mean_within_env_success_std": float(np.mean(success_stds)),
+    }
+
+
 def compare(records_a: list[dict], records_b: list[dict],
-            name_a: str, name_b: str) -> dict:
-    """Paired comparison of two variants run on identical seed lists."""
-    sa = {r["env_seed"]: r for r in records_a}
-    sb = {r["env_seed"]: r for r in records_b}
+            name_a: str, name_b: str,
+            aggregate_repeats: bool = True) -> dict:
+    """Paired comparison of two variants on identical environment seeds.
+
+    When cem_repeats > 1 produced multiple records per env_seed, repeats are
+    aggregated within each seed before pairing (environment seed is the
+    inferential unit).
+    """
+    a_recs = (aggregate_by_env_seed(records_a) if aggregate_repeats
+              else records_a)
+    b_recs = (aggregate_by_env_seed(records_b) if aggregate_repeats
+              else records_b)
+    sa = {r["env_seed"]: r for r in a_recs}
+    sb = {r["env_seed"]: r for r in b_recs}
     seeds = sorted(set(sa) & set(sb))
     a = [sa[s] for s in seeds]
     b = [sb[s] for s in seeds]
+    success_a = [r.get("success_rate", float(r["success"])) for r in a]
+    success_b = [r.get("success_rate", float(r["success"])) for r in b]
     return {
         "a": name_a, "b": name_b, "n_pairs": len(seeds),
+        "aggregated_repeats": bool(aggregate_repeats),
         "reward_diff": paired_bootstrap_diff(
             [r["reward"] for r in a], [r["reward"] for r in b]),
         "final_dist_diff": paired_bootstrap_diff(
             [r["final_goal_dist"] for r in a],
             [r["final_goal_dist"] for r in b]),
+        "success_rate_diff": paired_bootstrap_diff(success_a, success_b),
+        "collision_duration_diff": paired_bootstrap_diff(
+            [r["collision_duration"] for r in a],
+            [r["collision_duration"] for r in b]),
         "success_mcnemar": mcnemar_exact(
             [r["success"] for r in a], [r["success"] for r in b]),
     }

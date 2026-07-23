@@ -90,6 +90,16 @@ def main():
                     help="use a failed/ungated world model (diagnostics only)")
     ap.add_argument("--allow-legacy", action="store_true",
                     help="permit explicitly imported legacy checkpoints")
+    ap.add_argument("--manifest", type=str, default=None,
+                    help="factorial manifest for eval-dt")
+    ap.add_argument("--checkpoint", type=str, default=None,
+                    help="single checkpoint for eval-dt")
+    ap.add_argument("--all-factorial", action="store_true",
+                    help="eval-dt: newest factorial manifest")
+    ap.add_argument("--allow-legacy-buffer", action="store_true",
+                    help="train-wm: permit pre-provenance experience.npz")
+    ap.add_argument("--cem-repeats", type=int, default=1)
+    ap.add_argument("--equal-extra-checkpoint", type=str, default=None)
     args, extra = ap.parse_known_args()
 
     if args.command == "check":
@@ -111,15 +121,20 @@ def main():
               force=args.force, override_wm_gate=args.override_wm_gate)
     elif args.command == "train-wm":
         from training.train_world_model import train
-        train(force=args.force)
+        train(force=args.force,
+              allow_legacy_buffer=args.allow_legacy_buffer)
     elif args.command == "eval-dt":
         from scripts.eval_dt_robustness import main as run
-        run(args.episodes or 50, allow_legacy=args.allow_legacy)
+        run(args.episodes or 50, allow_legacy=args.allow_legacy,
+            checkpoint=args.checkpoint, manifest=args.manifest,
+            all_factorial=args.all_factorial)
     elif args.command == "eval-hier":
         from scripts.eval_hierarchy import main as run
         run(args.episodes or 100, layout=args.layout,
             override_wm_gate=args.override_wm_gate,
-            allow_legacy=args.allow_legacy)
+            allow_legacy=args.allow_legacy,
+            cem_repeats=args.cem_repeats,
+            equal_extra_checkpoint=args.equal_extra_checkpoint)
     elif args.command == "demo":
         sys.argv = [sys.argv[0]] + extra
         from scripts.run_live import main as run

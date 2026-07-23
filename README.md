@@ -51,8 +51,8 @@ genuine online belief adaptation.
 ```
 obs (22 ch, dt channel maskable)
   -> SpikeEncoder (analytic event-count LIF, multi-spike, held-current ZOH)
-  -> [spikes | obs | both] -> linear adapter (capacity-matched, 32 wide)
-  -> CfC liquid policy (dt-aware timespans) -> wheel commands
+  -> shared 54-d sensory bus [spikes|obs] (absent modalities zero-filled)
+  -> identical linear adapter (32 wide) -> CfC liquid policy (dt-aware)
         ^ subgoal latent, replanned every planner.period_seconds of
           PHYSICAL time: obs -> JEPA world model -> CEM planner
 ```
@@ -65,7 +65,7 @@ Key semantics (all recorded in checkpoint metadata, all validated on load):
 | `agent.timing_convention` | `causal` (SNN integrates the PREVIOUS measurement across the elapsed interval; first assimilation at elapsed time zero) / `irnn` (legacy irregular-RNN convention, clearly named, not called an exact physical model) |
 | `agent.mask_direct_dt` | replace the raw dt observation channel with its nominal value before any network sees it (no timing side-channel) |
 | `agent.snn_time_aware` / `cfc_time_aware` | physical elapsed time vs nominal fixed step per module (the timing factorial axes) |
-| `agent.use_input_adapter` | project every policy-input mode to a fixed width before an identical CfC (capacity matching) |
+| `agent.use_input_adapter` | shared 54-d sensory bus + identical adapter shapes before the CfC (fixed downstream architecture; report active parameter counts — not total-capacity matching) |
 
 The environment integrates collision contact at every physics substep
 (cost = lambda * measured contact duration) and clamps the final control
@@ -76,16 +76,21 @@ tests prove fixed and irregular schedules end at identical simulated times.
 
 - Checkpoints are `{"state", "meta"}` bundles: git commit + dirty flag,
   resolved config, seeds, parameter count, budget, timing distribution,
-  package versions, checksums, parent/warm-start and world-model checkpoint
-  references. Loading validates a compatibility block (semantics version,
-  input mode, timing flags, dt masking, SNN semantics, …) and fails with an
-  actionable error on mismatch.
+  package versions, canonical state checksums (verified on load), and
+  parent/warm-start / world-model references. Loading validates a
+  compatibility block (semantics version, input mode, timing flags, dt
+  masking, SNN semantics, sensory bus, …) and fails with an actionable
+  error on mismatch or checksum failure.
+- Replay buffers are fingerprinted (`experience_sv{N}_{sha8}.npz`) with
+  embedded metadata; incompatible or pre-provenance `experience.npz` files
+  are refused unless `--allow-legacy-buffer` is set and recorded.
 - Nothing overwrites an existing checkpoint or result without `--force`;
   result JSONs are timestamped and carry the exact checkpoint checksums
   evaluated.
 - Pre-provenance artifacts were imported via `python main.py import-legacy`
   into `models/legacy/*_legacy.pt`; they load only with `--allow-legacy`
-  and can never be mistaken for new experiments.
+  and can never be mistaken for new experiments. Coverage does not yet
+  extend to Stable-Baselines PPO zip internals.
 
 ## Workflow
 
@@ -100,6 +105,8 @@ python main.py train-wm                 # world model + planning gate
 python main.py train-hier               # hierarchical (refuses ungated WM)
 python main.py eval-hier                # 100-seed attribution evaluation
 python scripts/run_timing_factorial.py  # dry-run of the timing factorial
+python scripts/run_timing_factorial.py --smoke --run
+python scripts/eval_dt_robustness.py --all-factorial
 ```
 
 CMA-ES selection uses common random numbers within each generation and
@@ -112,22 +119,27 @@ noisiest training best.
   15/30/60/120 Hz and irregularly must produce consistent event counts and
   terminal states, including rates above the lowest sampling frequency
   (`tests/test_lif_semantics.py`; tolerances declared in the file).
-- **World-model gate** — the model must beat persistence on goal distance,
-  bearing and directional obstacle geometry at 2 s and 4 s open loop, not
-  be worse on false-safe collision prediction, and stay stable over the
-  rollout. The verdict is stored in the checkpoint; `train-hier` and
-  `eval-hier` refuse a failed/ungated model without `--override-wm-gate`.
-  On-policy validation (predicted vs realized readout on CEM-selected
-  transitions) is logged during hierarchy evaluation.
-- **Hierarchy gate** — claim planner value only if active learned planning
-  beats: planner-disabled (zero subgoal), norm/frequency-matched random
-  subgoals, shuffled subgoals, a geometric lidar-waypoint heuristic, AND
-  equal additional reactive training (`reactive-extra-budget` cell in the
-  factorial runner).
+- **World-model gate** — status `passed` / `failed` / `incomplete`. Must
+  beat persistence with minimum effect sizes and episode-clustered
+  uncertainty on goal/bearing/quads; beat or meaningfully match the
+  exact differential-drive kinematic baseline; keep left/right confusion
+  below a limit on enough decisive cases; and never treat undefined
+  false-safe rates (too few dangerous windows) as a pass. Verdict is
+  stored in the checkpoint; `train-hier` / `eval-hier` refuse
+  failed/incomplete/ungated models without `--override-wm-gate`.
+  Duration-averaged actions remain the transition baseline; an
+  order-sensitive action-duration encoder is next-stage work.
+- **Hierarchy gate** — status `passed` / `failed` / `incomplete`. Claim
+  planner value only if active planning beats zero/random/shuffled/
+  heuristic controls **and** original reactive **and** equal-extra
+  reactive training (`reactive-extra-budget`). Incomplete until the
+  equal-extra checkpoint exists. Primary endpoint: paired success
+  improvement; secondary: final distance; safety: collision duration.
 - **Continuous-time gate** — claim continuous-time value only if
   physical-time variants beat matched nominal-time variants with direct dt
-  masked, parameters capacity-matched, budgets equal, multiple training
-  seeds, and disturbances that genuinely require temporal inference.
+  masked, shared downstream adapter shapes, budgets equal, multiple
+  training seeds, and disturbances that genuinely require temporal
+  inference. Report active evolvable parameter counts honestly.
 - **Real-time reasoning gate** — claim online adaptation only after
   hidden mid-episode dynamics changes with recovery/identification metrics
   (Stage 4; not yet implemented).
@@ -136,7 +148,9 @@ noisiest training best.
 
 Per-episode records are saved verbatim in every result JSON. Aggregates use
 bootstrap CIs (mean/median), Wilson intervals (success), paired bootstrap
-and exact McNemar tests on identical seed lists. Ten-episode runs are
+and exact McNemar tests on identical seed lists. When `--cem-repeats > 1`,
+repeats are aggregated within each environment seed before pairing; within-
+environment planner variance is reported separately. Ten-episode runs are
 pilots and are labeled as such.
 
 ## Roadmap (deferred to later iterations)
@@ -147,7 +161,10 @@ pilots and are labeled as such.
   recovery-time metrics. The replay schema already carries capture and
   delivery timestamps in preparation.
 - Priority 8: order-sensitive transition model (GRU-D / CfC / kinematic +
-  learned residual) versus the chunk-averaged baseline.
+  learned residual) versus the **retained** duration-averaged-action
+  baseline; compare on planner-relevant grounded errors, false-safe rate,
+  CEM-selected on-policy prediction, and hierarchy performance before
+  replacing the averaged predictor.
 - Priority 11: full optimizer-matched architecture comparison (MLP/GRU/CfC
   x PPO/CMA-ES).
 - Stage 5: uncertainty ensembles and uncertainty-penalized CEM.

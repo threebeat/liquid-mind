@@ -60,9 +60,23 @@ def test_replay_records_event_times(tmp_path):
     buf.save(p)
     buf2 = ReplayBuffer.load(p)
     assert np.allclose(buf2.episodes[0]["t_capture"], e["t_capture"])
+    assert buf2.meta.get("semantics_version") is not None
 
 
-# ------------------------------------------------------- world-model gate
+def test_replay_refuses_legacy_without_override(tmp_path):
+    # Pre-provenance layout: no meta_json
+    p = str(tmp_path / "legacy.npz")
+    np.savez_compressed(
+        p, n=1,
+        obs_0=np.zeros((5, OBS_DIM), np.float32),
+        act_0=np.zeros((4, 2), np.float32),
+        dt_0=np.ones(4, np.float32) * 0.05)
+    with pytest.raises(ValueError) as e:
+        ReplayBuffer.load(p)
+    assert "provenance" in str(e.value).lower() or "metadata" in str(e.value)
+    buf = ReplayBuffer.load(p, allow_legacy_buffer=True)
+    assert len(buf) == 1
+    assert buf.meta.get("legacy_buffer") is True
 
 
 def test_wm_gate_and_enforcement(tmp_path):
@@ -70,6 +84,11 @@ def test_wm_gate_and_enforcement(tmp_path):
     cfg["agent"]["latent_dim"] = 8
     cfg["world_model"]["hidden_dim"] = 32
     buf = synthetic_buffer()
+    # Enrich with near-obstacle readings so danger / L-R cases exist
+    for e in buf.episodes:
+        e["obs"][:, :16] = 0.05  # dangerous rays
+        e["obs"][:, 4] = 0.5     # left clear
+        e["obs"][:, 12] = 0.01   # right near
     wm = WorldModel(OBS_DIM, 8, hidden=32)
     optim = torch.optim.Adam(wm.parameters(), lr=1e-3)
     rng = np.random.default_rng(0)
@@ -87,8 +106,11 @@ def test_wm_gate_and_enforcement(tmp_path):
                                             wm_compat)
     gate = evaluate_gate(wm, buf, 0.5, cfg, n_windows=40)
     assert gate["n_windows"] > 0
+    assert "status" in gate
+    assert gate["status"] in ("passed", "failed", "incomplete")
     assert set(gate["criteria"]) >= {"goal_beats_persistence_2s",
                                      "false_safe_not_worse_2s",
+                                     "goal_beats_or_matches_kinematic_2s",
                                      "open_loop_stable"}
     for h in ("0.5", "1.0", "2.0", "4.0"):
         m = gate["horizons"][h]
@@ -96,10 +118,20 @@ def test_wm_gate_and_enforcement(tmp_path):
         assert m["goal_dist_mae_m"]["persist"] is not None
         assert m["goal_dist_mae_m"]["kin"] is not None
 
+    # Synthetic buffer with no danger -> incomplete, never passed on safety
+    safe_buf = synthetic_buffer(seed=1)
+    for e in safe_buf.episodes:
+        e["obs"][:, :16] = 0.9
+    gate_safe = evaluate_gate(wm, safe_buf, 0.5, cfg, n_windows=30)
+    assert gate_safe["status"] == "incomplete"
+    assert gate_safe["passed"] is False
+    assert gate_safe["criteria"]["false_safe_not_worse_2s"] is None
+
     # gate enforcement: a FAILED model is refused unless overridden
     path = str(tmp_path / "wm.pt")
     failed = dict(gate)
     failed["passed"] = False
+    failed["status"] = "failed"
     meta = gather_provenance(cfg, "smoke_wm", extra={"gate": failed})
     save_checkpoint(path, wm.state_dict(), meta, wm_compat(cfg))
     with pytest.raises(ValueError) as e:
