@@ -10,3 +10,4 @@ ncps
 stable-baselines3
 cmaes
 pyyaml
+pytest

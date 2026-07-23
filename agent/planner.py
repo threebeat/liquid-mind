@@ -25,8 +25,14 @@ class CEMPlanner:
         self.action_dim = action_dim
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor) -> torch.Tensor:
-        """z0: (1, latent). Returns subgoal latent (1, latent)."""
+    def plan(self, z0: torch.Tensor, return_info: bool = False):
+        """z0: (1, latent). Returns subgoal latent (1, latent).
+
+        With return_info=True also returns a dict with the candidate-score
+        distribution of the final iteration, the best score seen, and the
+        predicted readout trajectory along the chosen plan — used for
+        on-policy world-model validation (predicted vs realized).
+        """
         H, P, A = self.horizon, self.population, self.action_dim
         mean = torch.zeros(H, A)
         std = torch.ones(H, A) * 0.6
@@ -34,22 +40,24 @@ class CEMPlanner:
 
         best_first_z = z0
         best_score = -float("inf")
+        best_traj = None
+        last_scores = None
         for _ in range(self.iterations):
             actions = (mean.unsqueeze(0) + std.unsqueeze(0)
                        * torch.randn(P, H, A)).clamp(-1, 1)
             z = z0.expand(P, -1)
             penalty = torch.zeros(P)
-            first_z = None
+            zs = []
             for h in range(H):
                 z = self.wm.predict_next(z, actions[:, h, :], dt)
-                if h == 0:
-                    first_z = z.clone()
+                zs.append(z)
                 # readout: [goal_dist, sin_b, cos_b, min ray per quadrant]
                 read = self.wm.readout(z)
                 min_ray = read[:, 3:].min(dim=1).values
                 penalty += torch.relu(0.08 - min_ray) * 5.0   # wall proximity
             goal_dist = self.wm.readout(z)[:, 0]
             score = -goal_dist - penalty
+            last_scores = score
             elite_idx = torch.topk(score, self.elites).indices
             elite = actions[elite_idx]
             mean = elite.mean(dim=0)
@@ -59,5 +67,19 @@ class CEMPlanner:
             it_best = float(score[elite_idx[0]])
             if it_best > best_score:
                 best_score = it_best
-                best_first_z = first_z[elite_idx[0]:elite_idx[0] + 1]
-        return best_first_z
+                i = int(elite_idx[0])
+                best_first_z = zs[0][i:i + 1]
+                best_traj = torch.stack([zh[i] for zh in zs])   # (H, latent)
+        if not return_info:
+            return best_first_z
+        pred_readouts = self.wm.readout(best_traj)              # (H, readout)
+        info = {
+            "best_score": best_score,
+            "score_mean": float(last_scores.mean()),
+            "score_std": float(last_scores.std()),
+            "score_min": float(last_scores.min()),
+            "score_max": float(last_scores.max()),
+            "chunk_dt": self.chunk_dt,
+            "predicted_readouts": pred_readouts.numpy().tolist(),
+        }
+        return best_first_z, info

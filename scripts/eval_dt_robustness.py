@@ -1,19 +1,23 @@
-"""Phase 2c: the real-time claim, tested — with the confounds controlled.
+"""Timing-robustness evaluation — with the confounds controlled.
 
-Both agents are trained at a fixed 30 Hz control rate and evaluated under
-increasing timing jitter. Design notes (deliberate, to keep the comparison
+Agents are evaluated under a progressive timing-disturbance ladder
+(Priority 4, level A). Design notes (deliberate, to keep the comparison
 fair):
   - jitter substep ranges are centered on the nominal 8 substeps, so the MEAN
-    control rate is identical across conditions — only the variance changes;
-  - episodes truncate on simulated time and the step penalty is charged per
-    unit of simulated time, so all conditions face the same physical horizon
-    and reward rate;
-  - both agents see dt in the observation; the liquid agent additionally
-    integrates it into its continuous-time dynamics (CfC timespans + LIF
-    exp(-dt/tau) leak). That integration is the mechanism under test.
+    control rate is identical across jitter conditions — only the variance
+    changes;
+  - episodes truncate at exactly the same simulated horizon and time costs
+    are charged per unit of simulated time, so all conditions face the same
+    physical problem;
+  - the "gaps" condition additionally injects rare 250-1000 ms observation
+    gaps (env.gap_prob) on top of mild jitter.
+
+Every episode record is retained; aggregates use bootstrap CIs and Wilson
+intervals, and each jitter level is compared to the fixed condition with a
+paired bootstrap on identical seeds (Priority 5).
 """
+import argparse
 import copy
-import json
 import os
 import sys
 
@@ -21,89 +25,100 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from common import MODELS_DIR, RESULTS_DIR, ensure_dirs, load_config
+from common import MODELS_DIR, ensure_dirs, load_config
+from provenance import checkpoint_ref, gather_provenance, write_results
 from agent.hybrid_agent import HybridAgent
 from environment.nav_env import NavEnv
+from scripts.eval_common import compare, run_episode, summarize
 
-# (label, substeps_min, substeps_max) — all means equal the nominal 8
-JITTER_LEVELS = [("fixed", None, None), ("mild", 6, 10), ("strong", 4, 12)]
+# (label, substeps_min, substeps_max, gap_prob) — jitter means equal the
+# nominal 8 substeps; "gaps" adds rare 250-1000 ms observation dropouts
+LADDER = [("fixed", None, None, 0.0),
+          ("mild", 6, 10, 0.0),
+          ("strong", 4, 12, 0.0),
+          ("wide", 2, 14, 0.0),
+          ("gaps", 6, 10, 0.02)]
+
+SEED_BASE = 555_000
 
 
-def _env_for(cfg, smin, smax):
+def _env_for(cfg, smin, smax, gap_prob):
     if smin is None:
         return NavEnv(cfg, irregular_dt=False)
     c = copy.deepcopy(cfg)
     c["env"]["substeps_min"] = smin
     c["env"]["substeps_max"] = smax
+    c["env"]["gap_prob"] = gap_prob
     return NavEnv(c, irregular_dt=True)
 
 
-def run_liquid(cfg, smin, smax, episodes, seed0):
-    env = _env_for(cfg, smin, smax)
+def _liquid_actor(cfg, allow_legacy):
     agent = HybridAgent(cfg, mode="reactive")
-    agent.load(os.path.join(MODELS_DIR, "liquid_policy.pt"))
-    rewards, successes = [], 0
-    for ep in range(episodes):
-        obs, _ = env.reset(seed=seed0 + ep)
-        agent.reset()
-        total, done = 0.0, False
-        while not done:
-            obs, r, term, trunc, info = env.step(agent.act(obs, env._last_dt))
-            total += r
-            done = term or trunc
-        rewards.append(total)
-        successes += int(info["is_success"])
-    env.close()
-    return np.asarray(rewards), successes
+    agent.load(os.path.join(MODELS_DIR, "liquid_policy.pt"),
+               allow_legacy=allow_legacy)
+    return agent.act, agent.reset
 
 
-def run_baseline(cfg, smin, smax, episodes, seed0):
+def _baseline_actor(cfg, allow_legacy):
     from stable_baselines3 import PPO
-    env = _env_for(cfg, smin, smax)
     model = PPO.load(os.path.join(MODELS_DIR, "ppo_baseline.zip"))
-    rewards, successes = [], 0
-    for ep in range(episodes):
-        obs, _ = env.reset(seed=seed0 + ep)
-        total, done = 0.0, False
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, r, term, trunc, info = env.step(action)
-            total += r
-            done = term or trunc
-        rewards.append(total)
-        successes += int(info["is_success"])
-    env.close()
-    return np.asarray(rewards), successes
+    return (lambda obs, dt: model.predict(obs, deterministic=True)[0],
+            lambda: None)
 
 
-def main(episodes: int = 50):
+def main(episodes: int = 50, allow_legacy: bool = False):
     cfg = load_config()
     ensure_dirs()
-    results = {}
-    for name, fn in [("mlp_baseline", run_baseline), ("liquid", run_liquid)]:
-        results[name] = {}
-        r_fixed = None
-        for label, smin, smax in JITTER_LEVELS:
-            rw, n_succ = fn(cfg, smin, smax, episodes, 555_000)
-            mean = float(rw.mean())
-            ci95 = float(1.96 * rw.std(ddof=1) / np.sqrt(len(rw)))
+    results = {"agents": {}}
+    for name, make_actor in [("mlp_baseline", _baseline_actor),
+                             ("liquid", _liquid_actor)]:
+        act, reset = make_actor(cfg, allow_legacy)
+        results["agents"][name] = {}
+        per_level_records = {}
+        for label, smin, smax, gap in LADDER:
+            env = _env_for(cfg, smin, smax, gap)
+            recs = [run_episode(env, act, reset, SEED_BASE + ep)
+                    for ep in range(episodes)]
+            env.close()
+            per_level_records[label] = recs
+            s = summarize(recs)
+            results["agents"][name][label] = {"summary": s, "episodes": recs}
+            print(f"{name:14s} {label:6s}: "
+                  f"R={s['reward_mean']['point']:7.2f} "
+                  f"[{s['reward_mean']['lo']:.2f},{s['reward_mean']['hi']:.2f}]"
+                  f"  (median {s['reward_median']['point']:.2f})  "
+                  f"success={s['success']['k']}/{s['success']['n']}",
+                  flush=True)
+        # paired comparison of each disturbed level against fixed timing
+        for label in per_level_records:
             if label == "fixed":
-                r_fixed = mean
-            drop = (r_fixed - mean) / (abs(r_fixed) + 1e-8) * 100
-            results[name][label] = {
-                "reward_mean": mean, "reward_ci95": ci95,
-                "reward_median": float(np.median(rw)),
-                "successes": n_succ, "episodes": episodes,
-                "drop_vs_fixed_pct": drop}
-            print(f"{name:14s} {label:6s}: R={mean:7.2f} +/-{ci95:5.2f} "
-                  f"(median {np.median(rw):6.2f})  "
-                  f"success={n_succ}/{episodes}  drop={drop:.1f}%", flush=True)
-    out = os.path.join(RESULTS_DIR, "dt_robustness.json")
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+                continue
+            c = compare(per_level_records[label], per_level_records["fixed"],
+                        label, "fixed")
+            results["agents"][name][label]["vs_fixed"] = c
+            d = c["reward_diff"]
+            print(f"{name:14s} {label:6s} vs fixed: "
+                  f"dR={d['mean_diff']:+7.2f} [{d['lo']:.2f},{d['hi']:.2f}] "
+                  f"{'(excludes 0)' if d['excludes_zero'] else '(includes 0)'}")
+
+    results["meta"] = gather_provenance(
+        cfg, experiment_name="eval_dt_robustness",
+        seeds={"seed_base": SEED_BASE, "episodes": episodes},
+        extra={"ladder": [{"label": l, "substeps_min": a, "substeps_max": b,
+                           "gap_prob": g} for l, a, b, g in LADDER],
+               "checkpoints": {
+                   "liquid": checkpoint_ref(
+                       os.path.join(MODELS_DIR, "liquid_policy.pt")),
+                   "mlp_baseline": checkpoint_ref(
+                       os.path.join(MODELS_DIR, "ppo_baseline.zip"))}})
+    out = write_results("dt_robustness", results)
     print(f"saved {out}")
     return results
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--episodes", type=int, default=50)
+    ap.add_argument("--allow-legacy", action="store_true")
+    a = ap.parse_args()
+    main(a.episodes, a.allow_legacy)

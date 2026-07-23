@@ -9,29 +9,55 @@ env:
   control_substeps: 8         # nominal control at 240/8 = 30 Hz
   substeps_min: 4             # irregular-dt mode: 20..60 Hz, mean matches the
   substeps_max: 12            # nominal 8 substeps so only variance changes
-  episode_seconds: 20.0       # truncate on simulated time, not decision count
+  gap_prob: 0.0               # irregular-dt mode: chance of a long observation
+  gap_substeps_min: 60        # gap per step; gap length 60..240 substeps
+  gap_substeps_max: 240       # (250..1000 ms). Disturbance ladder level A.
+  episode_seconds: 20.0       # truncate on simulated time; the final interval
+                              # is clamped so every schedule ends EXACTLY here
   max_wheel_speed: 20.0       # rad/s (wheel radius 0.06 m -> ~1.2 m/s top speed)
   goal_radius: 0.4
   reward:
     progress_scale: 5.0
     step_penalty: 0.005       # per *nominal* step; scaled by dt so the
                               # penalty rate is per-second, not per-decision
-    collision_penalty: 0.5
+    collision_penalty: 0.5    # per nominal step of MEASURED contact time
+                              # (contact integrated at every physics substep)
     success_bonus: 10.0
 
 agent:
   snn_neurons: 32             # LIF neurons in the spiking encoder
   snn_tau_mem: 0.15           # initial membrane time constant (seconds);
                               # per-neuron, learnable, leak = exp(-dt/tau)
+  snn_semantics: event_count  # event_count | sampled_binary | membrane | rate
+                              # event_count: analytic multi-spike LIF (exact
+                              # crossing times under held current, count
+                              # preserved). sampled_binary: legacy one-spike-
+                              # per-observation ablation. membrane/rate:
+                              # non-spiking smooth controls.
   lnn_units: 24               # liquid (CfC) neurons, AutoNCP wiring
   latent_dim: 16              # world-model embedding size
   policy_input: spikes_obs    # spikes_obs | spikes_only | obs_only (ablation)
+  use_input_adapter: true     # capacity matching: every policy_input mode is
+  adapter_dim: 32             # projected to this width before an identical CfC
   snn_time_aware: true        # false = fixed-step LIF (discrete-time control
   cfc_time_aware: true        # arm of the ablation); false = CfC fed nominal
                               # dt regardless of the true interval
+  mask_direct_dt: true        # replace the raw dt observation channel with
+                              # its nominal value before any network sees it
+                              # (no timing side-channel for nominal-time arms)
+  timing_convention: causal   # causal: the SNN integrates the PREVIOUS
+                              # measurement across the elapsed interval
+                              # (physical ZOH; first assimilation at t=0).
+                              # irnn: legacy irregular-RNN convention (the
+                              # new measurement is applied over the interval
+                              # that already elapsed).
 
 world_model:
-  chunk_steps: 15             # one macro-step ~ 0.5 s at nominal 30 Hz
+  chunk_steps: 15             # legacy decision-count chunking (kept for
+                              # compatibility tooling)
+  chunk_seconds: 0.5          # macro-transitions are defined by PHYSICAL
+                              # duration; a chunk holds a variable number of
+                              # action events under irregular timing
   hidden_dim: 64
   ema_momentum: 0.995
   lr: 0.001
@@ -44,6 +70,9 @@ planner:
   population: 64
   elites: 8
   iterations: 3
+  period_seconds: 0.5         # replan every this many SECONDS of physical
+                              # time (residual carried over -> no drift);
+                              # independent of the control-event schedule
   goal_tau: 0.4               # seconds; subgoal glides toward planner target
                               # via dg/dt = (1/tau)(z_target - g). Smooths the
                               # ~2 Hz planner output into a continuous signal.
@@ -54,5 +83,9 @@ training:
   cma_generations: 60
   cma_population: 24
   cma_sigma: 0.15
-  episodes_per_candidate: 2
+  episodes_per_candidate: 2   # screening with common random numbers
+  validation_episodes: 12     # held-out seed bank; the saved checkpoint is
+                              # the validation best, not the training best
+  train_irregular_dt: false   # train at the fixed nominal rate by default;
+                              # the factorial runner can enable jitter
   workers: 4

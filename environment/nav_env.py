@@ -18,7 +18,22 @@ Layouts:
 
 The env supports an irregular control interval (irregular_dt=True): each step
 simulates a random number of physics substeps, and the resulting dt is both
-returned in the observation and available to time-aware policies.
+returned in the observation and available to time-aware policies. Rare long
+observation gaps can be injected via env.gap_prob / gap_substeps_min/max.
+
+Physical-time exactness (semantics_version 2):
+  - contact is measured at EVERY physics substep and the collision penalty
+    integrates actual contact duration, C = lambda * integral(1_contact dt);
+    an interval is never charged just because contact exists at its endpoint;
+  - the final control interval is clamped so every episode — fixed or
+    irregular schedule — ends at exactly `episode_seconds` of simulated time
+    (substep-count bookkeeping, no float drift); the step cap remains only a
+    safety net;
+  - `_last_dt`, the reward scaling and the observation dt channel all use
+    the interval actually simulated.
+
+Kinematics reference (for model baselines): wheel radius 0.06 m, axle track
+0.23 m, wheel command in [-1, 1] scaled by env.max_wheel_speed rad/s.
 """
 import math
 import os
@@ -34,6 +49,11 @@ ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 OBS_DIM = 22
 ACT_DIM = 2
+DT_OBS_INDEX = 21          # observation element carrying normalized dt
+
+# differential-drive kinematic constants (must match assets/diffbot.urdf)
+WHEEL_RADIUS = 0.06        # m
+AXLE_TRACK = 0.23          # m (distance between wheel centers)
 
 
 class NavEnv(gym.Env):
@@ -58,6 +78,12 @@ class NavEnv(gym.Env):
         self.goal_radius = float(cfg["goal_radius"])
         self.episode_seconds = float(cfg.get("episode_seconds", 20.0))
         self.nominal_dt = self.nominal_substeps / self.physics_hz
+        # exact horizon: integer substep budget, identical for every schedule
+        self.episode_substeps = int(round(self.episode_seconds * self.physics_hz))
+        # rare long observation gaps (disturbance-ladder level A)
+        self.gap_prob = float(cfg.get("gap_prob", 0.0))
+        self.gap_substeps_min = int(cfg.get("gap_substeps_min", 60))
+        self.gap_substeps_max = int(cfg.get("gap_substeps_max", 240))
         # safety cap sized so it can NEVER truncate before the time horizon,
         # even if every interval lands at the fast end of the jitter range
         min_dt = self.substeps_min / self.physics_hz
@@ -179,11 +205,15 @@ class NavEnv(gym.Env):
             0, -1, vis, [self.goal[0], self.goal[1], 0.02])
 
         self._step_count = 0
+        self._sim_substeps = 0
         self._sim_time = 0.0
         self._last_dt = self.nominal_dt
+        self._in_contact = False
         obs = self._observe()
         self._prev_goal_dist = self._goal_dist()
-        return obs, {"goal_dist": self._prev_goal_dist}
+        pos, _ = self._pose()
+        return obs, {"goal_dist": self._prev_goal_dist, "sim_time": 0.0,
+                     "pos": (float(pos[0]), float(pos[1]))}
 
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
@@ -192,13 +222,38 @@ class NavEnv(gym.Env):
                 self.robot, j, p.VELOCITY_CONTROL,
                 targetVelocity=float(a) * self.max_wheel_speed, force=5.0)
 
-        substeps = (int(self.np_random.integers(self.substeps_min,
-                                                self.substeps_max + 1))
-                    if self.irregular_dt else self.nominal_substeps)
+        if self.irregular_dt:
+            if self.gap_prob > 0.0 and self.np_random.random() < self.gap_prob:
+                sampled = int(self.np_random.integers(
+                    self.gap_substeps_min, self.gap_substeps_max + 1))
+            else:
+                sampled = int(self.np_random.integers(self.substeps_min,
+                                                      self.substeps_max + 1))
+        else:
+            sampled = self.nominal_substeps
+        # clamp the final interval so every schedule ends at EXACTLY the
+        # configured physical horizon (integer substep budget -> no drift)
+        substeps = min(sampled, self.episode_substeps - self._sim_substeps)
+
+        # integrate contact over every physics substep: collision cost is
+        # lambda * (actual contact duration), never a whole interval charged
+        # for contact that only exists at its endpoint
+        contact_substeps = 0
+        collision_entries = 0
+        in_contact = self._in_contact
         for _ in range(substeps):
             self._pb.stepSimulation()
-        self._last_dt = substeps / self.physics_hz
-        self._sim_time += self._last_dt
+            c = self._in_collision()
+            contact_substeps += int(c)
+            if c and not in_contact:
+                collision_entries += 1
+            in_contact = c
+        self._in_contact = in_contact
+        contact_duration = contact_substeps / self.physics_hz
+
+        self._last_dt = substeps / self.physics_hz     # interval ACTUALLY run
+        self._sim_substeps += substeps
+        self._sim_time = self._sim_substeps / self.physics_hz
         self._step_count += 1
 
         obs = self._observe()
@@ -208,23 +263,25 @@ class NavEnv(gym.Env):
         # penalty is per unit of *simulated time* so that agents stepped at
         # different rates pay the same rate of time cost
         reward -= float(self.rw["step_penalty"]) * (self._last_dt / self.nominal_dt)
-        collided = self._in_collision()
-        if collided:
-            # persistent contact is charged per unit of simulated time, so a
-            # controller polled more often doesn't pay more for the same crash
-            reward -= (float(self.rw["collision_penalty"])
-                       * (self._last_dt / self.nominal_dt))
+        # collision cost integrates measured contact time (per nominal step,
+        # keeping the configured penalty scale comparable to earlier runs)
+        reward -= (float(self.rw["collision_penalty"])
+                   * (contact_duration / self.nominal_dt))
         self._prev_goal_dist = dist
 
         terminated = bool(dist < self.goal_radius)
         if terminated:
             reward += float(self.rw["success_bonus"])
-        # truncate on simulated time (physical horizon identical regardless of
-        # control rate); step cap is only a safety net
-        truncated = (self._sim_time >= self.episode_seconds
+        # truncate exactly at the physical horizon; step cap is a safety net
+        truncated = (self._sim_substeps >= self.episode_substeps
                      or self._step_count >= self.max_episode_steps)
 
-        info = {"goal_dist": dist, "collided": collided, "dt": self._last_dt,
+        pos, _ = self._pose()
+        info = {"goal_dist": dist, "collided": contact_substeps > 0,
+                "dt": self._last_dt, "sim_time": self._sim_time,
+                "contact_duration": contact_duration,
+                "collision_entries": collision_entries,
+                "pos": (float(pos[0]), float(pos[1])),
                 "is_success": terminated}
         return obs, float(reward), terminated, truncated, info
 

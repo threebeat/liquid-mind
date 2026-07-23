@@ -16,13 +16,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import torch
 
 from common import MODELS_DIR, load_config
-from environment.nav_env import OBS_DIM, NavEnv
+from environment.nav_env import NavEnv
 
 
-def pick_agent(cfg, choice):
+def pick_agent(cfg, choice, allow_legacy=False, override_wm_gate=False):
     have = {n: os.path.exists(os.path.join(MODELS_DIR, f))
             for n, f in [("hier", "hier_policy.pt"),
                          ("liquid", "liquid_policy.pt"),
@@ -42,18 +41,16 @@ def pick_agent(cfg, choice):
                 lambda: None)
 
     from agent.hybrid_agent import HybridAgent
-    from agent.world_model import WorldModel
     wm = None
     if choice == "hier":
-        wm = WorldModel(OBS_DIM, int(cfg["agent"]["latent_dim"]),
-                        hidden=int(cfg["world_model"]["hidden_dim"]))
-        wm.load_state_dict(torch.load(
-            os.path.join(MODELS_DIR, "world_model.pt"), weights_only=True))
-        wm.eval()
+        from training.train_world_model import load_world_model
+        wm, _ = load_world_model(cfg, override_gate=override_wm_gate,
+                                 allow_legacy=allow_legacy)
     agent = HybridAgent(cfg, mode="hierarchical" if choice == "hier"
                         else "reactive", world_model=wm)
     agent.load(os.path.join(
-        MODELS_DIR, "hier_policy.pt" if choice == "hier" else "liquid_policy.pt"))
+        MODELS_DIR, "hier_policy.pt" if choice == "hier" else "liquid_policy.pt"),
+        allow_legacy=allow_legacy)
     return agent.act, agent.reset
 
 
@@ -64,12 +61,15 @@ def main():
     ap.add_argument("--jitter", action="store_true")
     ap.add_argument("--layout", default="random", choices=["random", "u_trap"])
     ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--allow-legacy", action="store_true")
+    ap.add_argument("--override-wm-gate", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config()
     env = NavEnv(cfg, render_mode="human", irregular_dt=args.jitter,
                  layout=args.layout)
-    act, reset = pick_agent(cfg, args.agent)
+    act, reset = pick_agent(cfg, args.agent, allow_legacy=args.allow_legacy,
+                            override_wm_gate=args.override_wm_gate)
 
     for ep in range(args.episodes):
         obs, _ = env.reset()
