@@ -109,7 +109,9 @@ def train(generations: int | None = None, hierarchical: bool = False,
           workers: int | None = None, config: dict | None = None,
           experiment_name: str | None = None, seed: int = 0,
           force: bool = False, warm_start: bool = True,
-          override_wm_gate: bool = False, warm_from: str | None = None):
+          override_wm_gate: bool = False, warm_from: str | None = None,
+          run_kind: str = "full"):
+    assert run_kind in ("full", "smoke")
     cfg = config or load_config()
     ensure_dirs()
     tr = cfg["training"]
@@ -206,6 +208,11 @@ def train(generations: int | None = None, hierarchical: bool = False,
                        "validation_seeds": val_seeds.tolist()},
                 extra={"mode": template.mode,
                        "optimizer": "SepCMA",
+                       # run_kind lives in METADATA so downstream consumers
+                       # (equal-extra validation, manifest verification)
+                       # never have to infer smoke status from filenames
+                       "run_kind": run_kind,
+                       "smoke": run_kind == "smoke",
                        "parameter_count": template.n_parameters(),
                        "budget": {"generations": generations,
                                   "population": popsize,

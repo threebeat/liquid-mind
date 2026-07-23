@@ -120,8 +120,11 @@ noisiest training best.
   terminal states, including rates above the lowest sampling frequency
   (`tests/test_lif_semantics.py`; tolerances declared in the file).
 - **World-model gate** — status `passed` / `failed` / `incomplete`. Must
-  beat persistence with minimum effect sizes and episode-clustered
-  uncertainty on goal/bearing/quads; beat or meaningfully match the
+  beat persistence on goal/bearing/quads with the point estimate meeting
+  the minimum useful effect AND the episode-clustered bootstrap lower
+  bound above zero (evidence of positive improvement — deliberately not
+  "95% confidence the entire minimum effect is achieved"); beat or
+  meaningfully match the
   exact differential-drive kinematic baseline; keep left/right confusion
   below a limit on enough decisive cases; and never treat undefined
   false-safe rates (too few dangerous windows) as a pass. Verdict is
@@ -149,9 +152,16 @@ noisiest training best.
 Per-episode records are saved verbatim in every result JSON. Aggregates use
 bootstrap CIs (mean/median), Wilson intervals (success), paired bootstrap
 and exact McNemar tests on identical seed lists. When `--cem-repeats > 1`,
-repeats are aggregated within each environment seed before pairing; within-
-environment planner variance is reported separately. Ten-episode runs are
-pilots and are labeled as such.
+repeats are aggregated within each environment seed before pairing, the
+paired per-environment success-frequency bootstrap is the sole confirmatory
+success statistic (majority-collapsed McNemar becomes descriptive only, and
+50/50 majority ties are never counted as successes); within-environment
+planner variance is reported separately. Factorial robustness claims use a
+two-level design: env-seed-paired degradation within each training run,
+then one effect estimate per run summarized across training seeds
+(difference-in-differences contrasts and 2x2 main effects/interaction with
+the locked sign convention "positive = physical variant more robust").
+Ten-episode runs are pilots and are labeled as such.
 
 ## Roadmap (deferred to later iterations)
 

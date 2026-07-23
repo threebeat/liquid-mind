@@ -31,12 +31,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import torch
 
 from common import MODELS_DIR, ensure_dirs, load_config
-from provenance import checkpoint_ref, gather_provenance, write_results
+from provenance import (SEMANTICS_VERSION, checkpoint_ref, file_checksum,
+                        gather_provenance, write_results)
 from agent.hybrid_agent import HybridAgent
 from environment.nav_env import NavEnv
 from scripts.eval_common import (compare, run_episode, summarize,
+                                 summarize_env_level,
                                  within_env_planner_variance)
 
 PLANNER_SEED_BASE = 313_000
@@ -57,22 +60,91 @@ def _make_agent(cfg, mode, policy_file, wm, allow_legacy):
     path = (policy_file if os.path.isabs(policy_file)
             else os.path.join(MODELS_DIR, policy_file))
     agent = HybridAgent(cfg, mode=mode, world_model=wm)
-    agent.load(path, allow_legacy=allow_legacy)
-    return agent
+    meta = agent.load(path, allow_legacy=allow_legacy)
+    return agent, (meta or {})
 
 
-def _find_equal_extra(explicit: str | None = None) -> str | None:
+def _equal_extra_rejections(meta: dict, reactive_sha: str | None,
+                            hier_meta: dict) -> list[str]:
+    """Metadata-only validation of an equal-extra-budget candidate.
+
+    The FILENAME never decides anything: a full artifact misnamed "smoke"
+    passes; a smoke artifact without "smoke" in its name is rejected.
+    Returns a list of rejection reasons (empty = valid).
+    """
+    r = []
+    if "smoke" not in meta:
+        r.append("run_kind/smoke missing from metadata (pre-run_kind "
+                 "artifact; retrain)")
+    elif bool(meta["smoke"]):
+        r.append("smoke-budget artifact; the full gate requires "
+                 "run_kind == 'full'")
+    if meta.get("semantics_version") != SEMANTICS_VERSION:
+        r.append(f"semantics_version {meta.get('semantics_version')} != "
+                 f"{SEMANTICS_VERSION}")
+    if meta.get("mode") != "reactive":
+        r.append(f"mode {meta.get('mode')!r} != 'reactive' (no planner, "
+                 f"no shaping)")
+    parent = meta.get("parent_checkpoint") or {}
+    if reactive_sha is None:
+        r.append("current reactive checkpoint missing; cannot verify "
+                 "warm-start parent")
+    elif parent.get("sha256") != reactive_sha:
+        r.append("parent_checkpoint sha does not match the current "
+                 "reactive checkpoint (warm-started from something else)")
+    hb = hier_meta.get("budget") or {}
+    mb = meta.get("budget") or {}
+    for k in ("generations", "population", "episodes_per_candidate",
+              "validation_episodes"):
+        if hb.get(k) != mb.get(k):
+            r.append(f"budget.{k}={mb.get(k)} != hierarchical budget "
+                     f"{hb.get(k)}")
+    hs = (hier_meta.get("seeds") or {}).get("cma_seed")
+    ms = (meta.get("seeds") or {}).get("cma_seed")
+    if hs is not None and ms is not None and hs != ms:
+        r.append(f"cma_seed {ms} != hierarchical cma_seed {hs} "
+                 f"(matched-training design)")
+    ht = hier_meta.get("timing") or {}
+    mt = meta.get("timing") or {}
+    for k in set(ht) | set(mt):
+        if ht.get(k) != mt.get(k):
+            r.append(f"timing.{k}={mt.get(k)} != hierarchical {ht.get(k)}")
+    return r
+
+
+def _validated_equal_extra(hier_meta: dict, reactive_path: str,
+                           explicit: str | None = None):
+    """Find and VALIDATE the equal-extra-budget control by checkpoint
+    metadata. Any failure -> control treated as missing (gate incomplete),
+    with the rejection reasons recorded. Explicit paths get the same
+    validation — being handed a path is not evidence it is the right one.
+    """
     if explicit:
-        return explicit if os.path.exists(explicit) else None
-    patterns = [
-        os.path.join(MODELS_DIR, "factorial_reactive-extra-budget*.pt"),
-        os.path.join(MODELS_DIR, "*reactive-extra-budget*.pt"),
-    ]
-    hits = []
-    for pat in patterns:
-        hits.extend(glob.glob(pat))
-    hits = sorted(set(hits), key=os.path.getmtime, reverse=True)
-    return hits[0] if hits else None
+        candidates = [explicit]
+    else:
+        patterns = [
+            os.path.join(MODELS_DIR, "factorial_reactive-extra-budget*.pt"),
+            os.path.join(MODELS_DIR, "*reactive-extra-budget*.pt"),
+        ]
+        hits = []
+        for pat in patterns:
+            hits.extend(glob.glob(pat))
+        candidates = sorted(set(hits), key=os.path.getmtime, reverse=True)
+    reactive_sha = (file_checksum(reactive_path)
+                    if os.path.exists(reactive_path) else None)
+    rejections = {}
+    for cand in candidates:
+        if not os.path.exists(cand):
+            rejections[cand] = ["file missing"]
+            continue
+        payload = torch.load(cand, weights_only=True)
+        meta = (payload.get("meta") or {}) if isinstance(payload, dict) else {}
+        reasons = _equal_extra_rejections(meta, reactive_sha, hier_meta)
+        if not reasons:
+            return cand, {"validated": True, "checkpoint": cand,
+                          "rejections": rejections}
+        rejections[cand] = reasons
+    return None, {"validated": False, "rejections": rejections}
 
 
 def _run_variant(cfg, agent, episodes, layout, cem_repeats: int = 1):
@@ -144,15 +216,19 @@ def _planner_validation(planner_logs: list[list[dict]]) -> dict:
     return out
 
 
-def _beat_control(c: dict) -> dict:
-    """Primary: success_rate improvement with CI excluding 0 (or McNemar).
+def _beat_control(c: dict, cem_repeats: int = 1) -> dict:
+    """Primary: paired per-environment success-frequency improvement with CI
+    excluding 0. With cem_repeats > 1 that bootstrap is the SOLE primary
+    evidence (majority-collapsed McNemar is not confirmatory for repeated
+    stochastic runs); with single runs, exact McNemar remains an accepted
+    fallback for sparse rates.
     Secondary: final-distance improvement. Safety: collision not much worse.
     """
     sdiff = c["success_rate_diff"]
     primary = bool(sdiff["mean_diff"] > 0 and sdiff["excludes_zero"])
-    # Also accept clear McNemar evidence when rates are sparse
     mcn = c["success_mcnemar"]
-    if not primary and mcn["discordant"] > 0 and mcn["p_value"] < 0.05:
+    if (not primary and cem_repeats == 1 and mcn.get("applicable")
+            and mcn["discordant"] > 0 and mcn["p_value"] < 0.05):
         primary = mcn["a_only_success"] > mcn["b_only_success"]
     fdiff = c["final_dist_diff"]
     secondary = bool(fdiff["mean_diff"] < 0 and fdiff["excludes_zero"])
@@ -176,11 +252,15 @@ def main(episodes: int = 100, layout: str = "u_trap",
 
     reactive_file = "liquid_policy.pt"
     hier_file = "hier_policy.pt"
-    equal_extra_path = _find_equal_extra(equal_extra_checkpoint)
     results, all_records = {}, {}
 
     # 1) real planner first: collects subgoal norms/sequences for controls
-    agent = _make_agent(cfg, "hierarchical", hier_file, wm, allow_legacy)
+    agent, hier_meta = _make_agent(cfg, "hierarchical", hier_file, wm,
+                                   allow_legacy)
+    equal_extra_path, equal_extra_validation = _validated_equal_extra(
+        hier_meta, os.path.join(MODELS_DIR, reactive_file),
+        equal_extra_checkpoint)
+    results["equal_extra_validation"] = equal_extra_validation
     agent.subgoal_source = "planner"
     agent.log_planner = True
     print(f"[eval-hier] hier_planner ({episodes} episodes on {layout}, "
@@ -202,7 +282,7 @@ def main(episodes: int = 100, layout: str = "u_trap",
 
     # 2) controls on the SAME seeds (including shuffled with cem_repeats)
     def control(name, source, setup=None):
-        a = _make_agent(cfg, "hierarchical", hier_file, wm, allow_legacy)
+        a, _ = _make_agent(cfg, "hierarchical", hier_file, wm, allow_legacy)
         a.subgoal_source = source
         if setup:
             setup(a)
@@ -214,7 +294,7 @@ def main(episodes: int = 100, layout: str = "u_trap",
     control("hier_random", "random",
             lambda a: setattr(a, "random_subgoal_norm", mean_norm))
 
-    a = _make_agent(cfg, "hierarchical", hier_file, wm, allow_legacy)
+    a, _ = _make_agent(cfg, "hierarchical", hier_file, wm, allow_legacy)
     a.subgoal_source = "shuffled"
     print("[eval-hier] hier_shuffled...")
     env = NavEnv(cfg, layout=layout)
@@ -235,7 +315,7 @@ def main(episodes: int = 100, layout: str = "u_trap",
     control("hier_heuristic", "heuristic")
 
     # 3) reactive checkpoints on the same seeds
-    a = _make_agent(cfg, "reactive", reactive_file, None, allow_legacy)
+    a, _ = _make_agent(cfg, "reactive", reactive_file, None, allow_legacy)
     print("[eval-hier] reactive...")
     recs, _, _ = _run_variant(cfg, a, episodes, layout, cem_repeats)
     all_records["reactive"] = recs
@@ -243,25 +323,45 @@ def main(episodes: int = 100, layout: str = "u_trap",
     missing_controls = []
     if equal_extra_path:
         print(f"[eval-hier] equal_extra_reactive ({equal_extra_path})...")
-        a = _make_agent(cfg, "reactive", equal_extra_path, None, allow_legacy)
+        a, _ = _make_agent(cfg, "reactive", equal_extra_path, None,
+                           allow_legacy)
         recs, _, _ = _run_variant(cfg, a, episodes, layout, cem_repeats)
         all_records["equal_extra_reactive"] = recs
     else:
         missing_controls.append("equal_extra_reactive")
-        print("[eval-hier] equal_extra_reactive MISSING — gate incomplete "
-              "(train via run_timing_factorial.py --include-extra-reactive)")
+        print("[eval-hier] equal_extra_reactive MISSING or rejected — gate "
+              "incomplete (train via run_timing_factorial.py "
+              "--include-extra-reactive). Rejections: "
+              f"{equal_extra_validation['rejections']}")
 
     # ------------------------------------------------------------- report
+    # Primary summaries are ENVIRONMENT-LEVEL: CEM repeats are aggregated
+    # within each env seed before any uncertainty is computed. The raw
+    # planner-run distribution is retained for description only.
     results["variants"] = {}
     for name, recs in all_records.items():
-        s = summarize(recs)
-        results["variants"][name] = {"summary": s, "episodes": recs}
+        env_s = summarize_env_level(recs)
+        raw_s = summarize(recs)
+        raw_s["note"] = ("descriptive planner-run distribution; runs are "
+                         "not independent environment samples")
+        results["variants"][name] = {"summary_env_level": env_s,
+                                     "raw_run_summary": raw_s,
+                                     "episodes": recs}
+        if env_s.get("success") is not None:
+            succ = (f"success={env_s['success']['k']}/{env_s['success']['n']} "
+                    f"[{env_s['success']['lo']:.2f},"
+                    f"{env_s['success']['hi']:.2f}]")
+        else:
+            sr = env_s["success_rate_mean"]
+            succ = (f"success_freq={sr['point']:.2f} "
+                    f"[{sr['lo']:.2f},{sr['hi']:.2f}]")
         print(f"[eval-hier] {name:22s}: "
-              f"R={s['reward_mean']['point']:7.2f} "
-              f"[{s['reward_mean']['lo']:.2f},{s['reward_mean']['hi']:.2f}]  "
-              f"success={s['success']['k']}/{s['success']['n']} "
-              f"[{s['success']['lo']:.2f},{s['success']['hi']:.2f}]  "
-              f"final_dist={s['final_goal_dist_mean']['point']:.2f} m")
+              f"R={env_s['reward_mean']['point']:7.2f} "
+              f"[{env_s['reward_mean']['lo']:.2f},"
+              f"{env_s['reward_mean']['hi']:.2f}]  "
+              f"{succ}  "
+              f"final_dist={env_s['final_goal_dist_mean']['point']:.2f} m "
+              f"(n_env={env_s['env_units']})")
 
     required = ["reactive", "hier_zero", "hier_random", "hier_shuffled",
                 "hier_heuristic", "equal_extra_reactive"]
@@ -274,13 +374,16 @@ def main(episodes: int = 100, layout: str = "u_trap",
         c = compare(all_records["hier_planner"], all_records[other],
                     "hier_planner", other)
         results["comparisons"][f"hier_planner_vs_{other}"] = c
-        beat = _beat_control(c)
+        beat = _beat_control(c, cem_repeats)
         criteria[other] = {"available": True, **beat}
         d = c["success_rate_diff"]
+        mcn = c["success_mcnemar"]
+        mcn_str = (f"McNemar p={mcn['p_value']:.3f}" if mcn.get("applicable")
+                   else "McNemar n/a (repeated runs)")
         print(f"[eval-hier] planner vs {other:22s}: "
               f"dSuccess={d['mean_diff']:+.3f} [{d['lo']:.3f},{d['hi']:.3f}] "
               f"{'(excludes 0)' if d['excludes_zero'] else '(includes 0)'}  "
-              f"McNemar p={c['success_mcnemar']['p_value']:.3f}  "
+              f"{mcn_str}  "
               f"beat={'YES' if beat['passed'] else 'no'}")
 
     if missing_controls:
@@ -298,6 +401,9 @@ def main(episodes: int = 100, layout: str = "u_trap",
         "passed": passed,
         "criteria": criteria,
         "missing_controls": missing_controls,
+        "missing_control_reasons": (
+            {"equal_extra_reactive": equal_extra_validation["rejections"]}
+            if "equal_extra_reactive" in missing_controls else {}),
         "primary_endpoint": "paired_success_rate",
         "note": ("Gate remains incomplete until equal-extra-reactive exists "
                  "and is evaluated. Pass requires beating all six controls "

@@ -204,12 +204,24 @@ def _clustered_mean_diff(model_errs, base_errs, episode_ids, n_boot=2000,
             "n_windows": int(len(model_errs))}
 
 
+def _ci_positive(es: dict | None) -> bool:
+    """Clustered-bootstrap evidence of a positive improvement: the lower
+    95% bound must exceed zero."""
+    return bool(es and es.get("lo") is not None and es["lo"] > 0)
+
+
 def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
                   cfg: dict, horizons=(0.5, 1.0, 2.0, 4.0),
                   n_windows: int = 300, seed: int = 1) -> dict:
     """Open-loop rollout evaluation of every grounded readout, against
     persistence and kinematic baselines. Returns metrics + gate verdict
     with status in {passed, failed, incomplete}.
+
+    Improvement criteria require the POINT ESTIMATE to meet the minimum
+    useful effect AND the clustered (episode-level) bootstrap lower bound
+    to exceed zero — i.e. evidence of positive improvement, with the point
+    estimate meeting the practical-effect threshold. This is deliberately
+    NOT "95% confidence that the entire minimum useful effect is achieved".
     """
     rng = np.random.default_rng(seed)
     max_wheel = float(cfg["env"]["max_wheel_speed"])
@@ -402,6 +414,7 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
         and (abs_ok or rel_ok)
         and es2["goal_vs_persist"]["mean_diff"] is not None
         and es2["goal_vs_persist"]["mean_diff"] > 0
+        and _ci_positive(es2["goal_vs_persist"])
         and g_model <= max_abs_goal)
 
     # Beat kinematic, or within ε of kin while clearly beating persistence
@@ -417,7 +430,8 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
         b_model is not None and b_persist is not None
         and (b_persist - b_model) >= MIN_BEAR_IMPROVE_RAD
         and es2["bear_vs_persist"]["mean_diff"] is not None
-        and es2["bear_vs_persist"]["mean_diff"] > 0)
+        and es2["bear_vs_persist"]["mean_diff"] > 0
+        and _ci_positive(es2["bear_vs_persist"]))
     bear_kin_ok = bool(
         b_model is not None and b_kin is not None
         and (b_model < b_kin - 1e-9 or b_model <= b_kin + 0.05))
@@ -428,15 +442,18 @@ def evaluate_gate(wm: WorldModel, buf: ReplayBuffer, chunk_seconds: float,
         and _m(2.0, "quadrant_mae", "model")
         < _m(2.0, "quadrant_mae", "persist")
         and es2["quad_vs_persist"]["mean_diff"] is not None
-        and es2["quad_vs_persist"]["mean_diff"] > 0)
+        and es2["quad_vs_persist"]["mean_diff"] > 0
+        and _ci_positive(es2["quad_vs_persist"]))
 
+    es4 = metrics["effect_sizes"].get("4.0", {})
     criteria = {
         "goal_beats_persistence_2s": goal_persist_ok,
-        "goal_beats_persistence_4s": (
+        "goal_beats_persistence_4s": bool(
             _m(4.0, "goal_dist_mae_m", "model") is not None
             and _m(4.0, "goal_dist_mae_m", "persist") is not None
             and _m(4.0, "goal_dist_mae_m", "model")
-            < _m(4.0, "goal_dist_mae_m", "persist")),
+            < _m(4.0, "goal_dist_mae_m", "persist")
+            and _ci_positive(es4.get("goal_vs_persist"))),
         "goal_beats_or_matches_kinematic_2s": kin_ok,
         "bearing_beats_persistence_2s": bear_persist_ok,
         "bearing_beats_or_matches_kinematic_2s": bear_kin_ok,
