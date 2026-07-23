@@ -24,6 +24,7 @@ the parent checkpoint checksum in the metadata.
 import argparse
 import multiprocessing as mp
 import os
+import random
 import sys
 import time
 
@@ -41,6 +42,25 @@ from environment.nav_env import NavEnv
 # seed banks: training seeds and validation seeds must never overlap
 TRAIN_SEED_MAX = 800_000
 VALIDATION_SEED_BASE = 900_000
+
+
+def seed_training_run(seed: int) -> dict:
+    """Reset EVERY RNG a training run depends on, before any module is
+    constructed. This makes the initial parameter vector a deterministic
+    function of the training seed — matched seeds across factorial cells
+    start from the same initialization regardless of prior RNG history
+    (preflight instantiation, cell ordering, resumed runs).
+
+    Returns the complete seeding policy for checkpoint metadata.
+    """
+    seed = int(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return {"training_seed": seed, "torch_seed": seed, "numpy_seed": seed,
+            "python_seed": seed, "cma_seed": seed}
 
 _ENV = None
 _AGENT = None
@@ -112,6 +132,12 @@ def train(generations: int | None = None, hierarchical: bool = False,
           override_wm_gate: bool = False, warm_from: str | None = None,
           run_kind: str = "full"):
     assert run_kind in ("full", "smoke")
+    # FIRST: deterministic initialization. Must precede _make_agent() (and
+    # any torch module construction) so the initial parameter vector depends
+    # only on the training seed. Worker processes need no seeding for
+    # reproducibility: every candidate's parameters are overwritten by
+    # _unflatten before evaluation.
+    seed_policy = seed_training_run(seed)
     cfg = config or load_config()
     ensure_dirs()
     tr = cfg["training"]
@@ -204,7 +230,7 @@ def train(generations: int | None = None, hierarchical: bool = False,
             meta = gather_provenance(
                 cfg, experiment_name=experiment_name,
                 variant=template.variant_tag(),
-                seeds={"cma_seed": seed,
+                seeds={**seed_policy,
                        "validation_seeds": val_seeds.tolist()},
                 extra={"mode": template.mode,
                        "optimizer": "SepCMA",

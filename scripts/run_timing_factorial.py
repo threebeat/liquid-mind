@@ -114,6 +114,59 @@ def build_plans(cells, seeds, smoke, cfg, train_jitter):
     return plans
 
 
+EXPECTED_SMOKE_SEEDS = (0, 1)
+
+
+def check_smoke_manifest_complete(failures: list[str]) -> None:
+    """STRICT Gate C' completeness: a full run requires the latest smoke
+    manifest to contain exactly the 6 expected cells x seeds {0, 1} = 12
+    runs, all completed/skipped_valid, all passing integrity verification,
+    all semantics v3. An incomplete-but-not-invalid manifest must fail."""
+    from provenance import SEMANTICS_VERSION
+
+    smoke_man = discover_latest_manifest(smoke=True)
+    if smoke_man is None:
+        failures.append("full run requires a complete Gate C' smoke "
+                        "manifest; none found (run --smoke --run first)")
+        return
+    try:
+        man = load_manifest(smoke_man)
+    except Exception as e:
+        failures.append(f"smoke manifest {smoke_man} unreadable: {e}")
+        return
+    expected = {(c["name"], s) for c in factorial_cells()
+                for s in EXPECTED_SMOKE_SEEDS}
+    entries = {(e.get("cell_id") or e.get("name"), e.get("training_seed")): e
+               for e in man.get("cells", [])}
+    missing = sorted(f"{c}__s{s}" for c, s in expected - set(entries))
+    if missing:
+        failures.append(f"smoke manifest missing expected runs: {missing}")
+    n_verified = 0
+    for key in sorted(expected & set(entries)):
+        entry = entries[key]
+        rid = entry.get("run_id", f"{key[0]}__s{key[1]}")
+        status = entry.get("status", "completed")
+        if status not in ("completed", "skipped_valid"):
+            failures.append(f"smoke run {rid} has status {status!r} "
+                            f"(need completed/skipped_valid)")
+            continue
+        try:
+            v = verify_manifest_cell(entry)
+        except (ValueError, FileNotFoundError) as e:
+            failures.append(f"smoke run {rid} fails integrity "
+                            f"verification: {e}")
+            continue
+        if v.get("semantics_version") != SEMANTICS_VERSION:
+            failures.append(f"smoke run {rid} has semantics_version "
+                            f"{v.get('semantics_version')} != "
+                            f"{SEMANTICS_VERSION}")
+            continue
+        n_verified += 1
+    print(f"[preflight] Gate C' smoke manifest {smoke_man}: "
+          f"{n_verified}/{len(expected)} expected runs verified "
+          f"({'COMPLETE' if n_verified == len(expected) else 'INCOMPLETE'})")
+
+
 def preflight(plans, smoke: bool) -> int:
     """Validate the planned factorial without training. Returns exit code."""
     import torch
@@ -164,29 +217,34 @@ def preflight(plans, smoke: bool) -> int:
     print(f"[preflight] evaluation: {len(plans)} runs x {len(LADDER)} ladder "
           f"levels x ~50 episodes = ~{len(plans) * len(LADDER) * 50} episodes")
 
-    smoke_man = discover_latest_manifest(smoke=True)
-    if smoke_man is None:
-        print("[preflight] no smoke manifest found (run --smoke --run first "
-              "to validate plumbing)")
+    if smoke:
+        # Smoke preflight: informational check of any existing smoke manifest
+        smoke_man = discover_latest_manifest(smoke=True)
+        if smoke_man is None:
+            print("[preflight] no smoke manifest found (run --smoke --run "
+                  "first to validate plumbing)")
+        else:
+            try:
+                man = load_manifest(smoke_man)
+                bad = 0
+                for entry in man.get("cells", []):
+                    if entry.get("status", "completed") not in (
+                            "completed", "skipped_valid"):
+                        continue
+                    try:
+                        verify_manifest_cell(entry)
+                    except (ValueError, FileNotFoundError) as e:
+                        bad += 1
+                        failures.append(
+                            f"smoke manifest entry {entry.get('run_id')} "
+                            f"fails verification: {e}")
+                print(f"[preflight] smoke manifest {smoke_man}: "
+                      f"{'OK' if bad == 0 else f'{bad} entries FAIL verification'}")
+            except Exception as e:
+                failures.append(f"smoke manifest {smoke_man} unreadable: {e}")
     else:
-        try:
-            man = load_manifest(smoke_man)
-            bad = 0
-            for entry in man.get("cells", []):
-                if entry.get("status", "completed") not in (
-                        "completed", "skipped_valid"):
-                    continue
-                try:
-                    verify_manifest_cell(entry)
-                except (ValueError, FileNotFoundError) as e:
-                    bad += 1
-                    failures.append(
-                        f"smoke manifest entry {entry.get('run_id')} fails "
-                        f"verification: {e}")
-            print(f"[preflight] smoke manifest {smoke_man}: "
-                  f"{'OK' if bad == 0 else f'{bad} entries FAIL verification'}")
-        except Exception as e:
-            failures.append(f"smoke manifest {smoke_man} unreadable: {e}")
+        # Full preflight: the Gate C' smoke manifest must be COMPLETE
+        check_smoke_manifest_complete(failures)
 
     if failures:
         print("\n[preflight] FAILED:")
@@ -217,7 +275,20 @@ def main():
     ap.add_argument("--fail-fast", action="store_true",
                     help="stop at the first failed run (default: continue "
                     "to independent cells and exit nonzero at the end)")
+    ap.add_argument("--stamp", type=str, default=None,
+                    help="manifest timestamp to reuse (resume a full run "
+                    "into the SAME manifest, preserving attempt history)")
+    ap.add_argument("--allow-underpowered-full", action="store_true",
+                    help="diagnostic override of the --seeds >= 5 "
+                    "requirement for full runs; recorded in the manifest")
     args = ap.parse_args()
+
+    if (args.run and not args.smoke and args.seeds < 5
+            and not args.allow_underpowered_full):
+        ap.error("full Gate D requires --seeds >= 5 (preregistered "
+                 "replicates); use --allow-underpowered-full only for "
+                 "deliberate diagnostics — the override is recorded in "
+                 "the manifest")
 
     cfg = load_config()
     ensure_dirs()
@@ -249,9 +320,13 @@ def main():
         return
 
     from training.train_policy import train
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stamp = args.stamp or time.strftime("%Y%m%d_%H%M%S")
     man_path = manifest_path(smoke=args.smoke,
                              stamp=None if args.smoke else stamp)
+    man_meta = {"stamp": None if args.smoke else stamp}
+    if args.allow_underpowered_full and not args.smoke:
+        man_meta["underpowered_override"] = True
+        man_meta["seeds_requested"] = args.seeds
 
     # Merge prior manifest so retraining with --force increments `attempt`
     # and preserves the historical record instead of silently replacing it.
@@ -284,7 +359,7 @@ def main():
         entry["attempt_history"] = history
         set_run_status(entry, "planned")
         entries.append(entry)
-    write_manifest(man_path, entries, smoke=args.smoke)
+    write_manifest(man_path, entries, smoke=args.smoke, meta=man_meta)
     print(f"[factorial] planned manifest written: {man_path}")
 
     any_failed = False
@@ -310,13 +385,13 @@ def main():
                 print(f"[factorial] FAIL {run_id}: existing checkpoint does "
                       f"not match the planned spec (--force to retrain)\n"
                       f"  {e}")
-            write_manifest(man_path, entries, smoke=args.smoke)
+            write_manifest(man_path, entries, smoke=args.smoke, meta=man_meta)
             if any_failed and args.fail_fast:
                 break
             continue
 
         set_run_status(entry, "training")
-        write_manifest(man_path, entries, smoke=args.smoke)
+        write_manifest(man_path, entries, smoke=args.smoke, meta=man_meta)
         print(f"\n[factorial] === training {run_id} "
               f"(experiment {p['experiment']}, attempt {entry['attempt']}) ===")
         try:
@@ -332,12 +407,12 @@ def main():
                            error=f"{type(e).__name__}: {e}")
             any_failed = True
             print(f"[factorial] FAILED {run_id}: {type(e).__name__}: {e}")
-        write_manifest(man_path, entries, smoke=args.smoke)
+        write_manifest(man_path, entries, smoke=args.smoke, meta=man_meta)
         if any_failed and args.fail_fast:
             print("[factorial] --fail-fast: stopping at first failure")
             break
 
-    write_manifest(man_path, entries, smoke=args.smoke)
+    write_manifest(man_path, entries, smoke=args.smoke, meta=man_meta)
     by_status = {}
     for e in entries:
         by_status.setdefault(e["status"], []).append(e["run_id"])

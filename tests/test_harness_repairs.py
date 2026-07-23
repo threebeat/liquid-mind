@@ -541,6 +541,121 @@ def test_equal_extra_metadata_validation():
     assert any("mode" in r for r in rej(m, "REACTIVE_SHA", HIER_META))
 
 
+# ------------------------------------------ deterministic training init
+
+
+def _init_vector(cfg):
+    from training.train_policy import _flatten
+    return _flatten(HybridAgent(cfg, mode="reactive").parameters())
+
+
+def test_seed_training_run_same_seed_identical_init():
+    from training.train_policy import seed_training_run
+    cfg = load_config()
+    seed_training_run(0)
+    v1 = _init_vector(cfg)
+    seed_training_run(0)
+    v2 = _init_vector(cfg)
+    assert np.array_equal(v1, v2)
+
+
+def test_seed_training_run_different_seeds_differ():
+    from training.train_policy import seed_training_run
+    cfg = load_config()
+    seed_training_run(0)
+    v0 = _init_vector(cfg)
+    seed_training_run(1)
+    v1 = _init_vector(cfg)
+    assert not np.array_equal(v0, v1)
+
+
+def test_matched_init_across_all_six_cells_and_order_invariant():
+    """Same training seed -> identical initial parameter vector in every
+    factorial cell (timing flags change dynamics, not tensor shapes), and
+    the build ORDER of cells does not change any cell's init."""
+    from scripts.run_timing_factorial import cell_config, factorial_cells
+    from training.train_policy import seed_training_run
+    cfg = load_config()
+    cells = factorial_cells()
+    assert len(cells) == 6
+
+    def build(cell):
+        c = cell_config(cfg, cell, smoke=True, train_jitter=False)
+        seed_training_run(0)
+        return _init_vector(c)
+
+    vecs = {c["name"]: build(c) for c in cells}
+    ref = vecs[cells[0]["name"]]
+    for name, v in vecs.items():
+        assert np.array_equal(v, ref), f"cell {name} init differs"
+    # reordering the cells changes nothing
+    for cell in reversed(cells):
+        assert np.array_equal(build(cell), vecs[cell["name"]])
+
+
+def test_seeding_immune_to_prior_rng_history():
+    """A preflight (or any prior RNG use) cannot change training init,
+    because train() resets its own RNG state via seed_training_run."""
+    import random as pyrandom
+    from training.train_policy import seed_training_run
+    cfg = load_config()
+    seed_training_run(0)
+    clean = _init_vector(cfg)
+    # pollute every global RNG, as a preflight/param-count pass might
+    torch.manual_seed(999)
+    torch.randn(257)
+    np.random.rand(31)
+    pyrandom.random()
+    seed_training_run(0)
+    assert np.array_equal(_init_vector(cfg), clean)
+
+
+def test_seed_policy_metadata_complete():
+    from training.train_policy import seed_training_run
+    pol = seed_training_run(3)
+    assert pol == {"training_seed": 3, "torch_seed": 3, "numpy_seed": 3,
+                   "python_seed": 3, "cma_seed": 3}
+
+
+# --------------------------------------------------------- runner guards
+
+
+def test_full_run_requires_five_seeds(monkeypatch):
+    import sys as _sys
+    from scripts.run_timing_factorial import main as runner_main
+    monkeypatch.setattr(_sys, "argv",
+                        ["run_timing_factorial.py", "--run", "--seeds", "2"])
+    with pytest.raises(SystemExit) as exc:
+        runner_main()
+    assert exc.value.code == 2                    # argparse error
+    # smoke runs stay exempt (dry-run path, no --run needed to check parse)
+    monkeypatch.setattr(_sys, "argv",
+                        ["run_timing_factorial.py", "--smoke", "--seeds", "2"])
+    runner_main()                                 # dry-run, no exception
+
+
+def test_full_preflight_requires_complete_smoke_manifest(tmp_path,
+                                                         monkeypatch):
+    import scripts.run_timing_factorial as rt
+
+    # no smoke manifest at all
+    monkeypatch.setattr(rt, "discover_latest_manifest", lambda smoke: None)
+    failures = []
+    rt.check_smoke_manifest_complete(failures)
+    assert any("none found" in f for f in failures)
+
+    # incomplete manifest (empty) -> every expected run reported missing
+    empty = str(tmp_path / "factorial_manifest_smoke.json")
+    write_manifest(empty, [], smoke=True)
+    monkeypatch.setattr(rt, "discover_latest_manifest", lambda smoke: empty)
+    failures = []
+    rt.check_smoke_manifest_complete(failures)
+    assert any("missing expected runs" in f for f in failures)
+    missing_msg = next(f for f in failures if "missing expected runs" in f)
+    assert "physsnn-physcfc-masked__s0" in missing_msg
+    assert "nomsnn-nomcfc-visible__s1" in missing_msg
+
+
 # --------------------------------------------------- WM gate CI enforcement
 
 

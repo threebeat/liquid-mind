@@ -289,6 +289,7 @@ def verify_manifest_cell(cell: dict, expected_spec: dict | None = None) -> dict:
     return {"verified": True, "file_sha256": actual_sha,
             "experiment": meta.get("experiment"),
             "run_kind": meta.get("run_kind"),
+            "semantics_version": meta.get("semantics_version"),
             "training_seed": seeds.get("cma_seed")}
 
 
