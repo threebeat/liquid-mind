@@ -69,7 +69,10 @@ def _make_weights(cfg: ReservoirConfig):
     w_in *= rng.random((cfg.n_units, cfg.n_inputs)) < cfg.input_density
     w_rec = rng.uniform(-1.0, 1.0, (cfg.n_units, cfg.n_units))
     w_rec *= rng.random((cfg.n_units, cfg.n_units)) < cfg.sparsity
-    eig = np.max(np.abs(np.linalg.eigvals(w_rec)))
+    # torch LAPACK: numpy's MKL eig/solve can hit the Windows 0xc06d007f
+    # fatal error in processes that also load pybullet
+    eig = float(torch.linalg.eigvals(
+        torch.from_numpy(w_rec).double()).abs().max())
     if eig < 1e-12:
         raise ValueError(f"degenerate reservoir (seed {cfg.seed}): "
                          f"spectral radius ~ 0; regenerate with another seed")

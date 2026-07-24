@@ -27,6 +27,23 @@ def endpoint_targets(batch: dict, steps: int):
     return batch["future_lidar"][:, steps - 1], batch["future_body"][:, steps - 1]
 
 
+def ridge_solve(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
+    """(X^T X + lam I)^-1 X^T Y via torch LAPACK. NumPy's MKL solve hits the
+    Windows 0xc06d007f fatal error in processes that also load pybullet;
+    torch's linear algebra does not."""
+    xt = torch.from_numpy(np.ascontiguousarray(x)).double()
+    yt = torch.from_numpy(np.ascontiguousarray(y)).double()
+    a = xt.T @ xt + lam * torch.eye(xt.shape[1], dtype=torch.float64)
+    return torch.linalg.solve(a, xt.T @ yt).numpy()
+
+
+def mm(x: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Matrix product via torch (same 0xc06d007f workaround as ridge_solve:
+    numpy MKL GEMM is fatal in pybullet-hosting processes on this machine)."""
+    return (torch.from_numpy(np.ascontiguousarray(x)).double()
+            @ torch.from_numpy(np.ascontiguousarray(w)).double()).numpy()
+
+
 # ------------------------------------------------------------- persistence
 
 
@@ -73,14 +90,13 @@ class LinearARBaseline:
             x = self._features(batch, steps).astype(np.float64)
             tl, tb = endpoint_targets(batch, steps)
             y = np.concatenate([tl, tb], axis=1).astype(np.float64)
-            a = x.T @ x + self.lam * np.eye(x.shape[1])
-            self.weights[h] = np.linalg.solve(a, x.T @ y)
+            self.weights[h] = ridge_solve(x, y, self.lam)
         return self
 
     def predict(self, batch: dict) -> dict:
         out = {"lidar": {}, "body": {}}
         for h, steps in self.horizon_steps.items():
-            y = self._features(batch, steps).astype(np.float64) @ self.weights[h]
+            y = mm(self._features(batch, steps), self.weights[h])
             out["lidar"][h] = y[:, :16].astype(np.float32)
             out["body"][h] = y[:, 16:].astype(np.float32)
         return out
@@ -95,9 +111,8 @@ def ridge_probe(x_train, y_train, x_val, y_val, lam: float = 1e-3) -> dict:
     x_va = np.concatenate([x_val, np.ones((len(x_val), 1))], 1).astype(np.float64)
     y_tr = np.asarray(y_train, np.float64).reshape(len(x_train), -1)
     y_va = np.asarray(y_val, np.float64).reshape(len(x_val), -1)
-    w = np.linalg.solve(x_tr.T @ x_tr + lam * np.eye(x_tr.shape[1]),
-                        x_tr.T @ y_tr)
-    pred = x_va @ w
+    w = ridge_solve(x_tr, y_tr, lam)
+    pred = mm(x_va, w)
     mse = float(np.mean((pred - y_va) ** 2))
     var = float(np.mean((y_va - y_va.mean(0)) ** 2))
     return {"mse": mse, "r2": 1.0 - mse / var if var > 1e-12 else None}
