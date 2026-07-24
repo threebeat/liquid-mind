@@ -75,15 +75,36 @@ def collect_range(cfg: dict, seed_lo: int, seed_hi: int,
     return buf
 
 
+def _policy_usable(cfg: dict) -> bool:
+    """The legacy liquid_policy.pt is a bare pre-provenance state dict;
+    HybridAgent.load refuses it, so collection falls back to random actions.
+    Resolve that up front so the buffer meta records the TRUE behavior."""
+    policy_path = os.path.join(MODELS_DIR, "liquid_policy.pt")
+    if not os.path.exists(policy_path):
+        return False
+    try:
+        from agent.hybrid_agent import HybridAgent
+        agent = HybridAgent(cfg, mode="reactive")
+        agent.load(policy_path)
+        return True
+    except (ValueError, RuntimeError):
+        return False
+
+
 def buffer_path_for(cfg: dict, stage: str, split: str) -> tuple[str, dict]:
     lo, hi = SEED_RANGES[stage][split]
     policy_path = os.path.join(MODELS_DIR, "liquid_policy.pt")
+    usable = _policy_usable(cfg)
     meta = ReplayBuffer.build_meta(
         cfg, seed_range=(lo, hi),
-        policy_checkpoint=policy_path if os.path.exists(policy_path) else None,
+        policy_checkpoint=policy_path if usable else None,
         extra={"experiment": EXPERIMENT, "phase1_stage": stage,
-               "phase1_split": split})
-    return ReplayBuffer.fingerprint_name(meta, DATA_DIR), meta
+               "phase1_split": split,
+               "behavior_policy": "liquid+noise" if usable else "random"})
+    # fingerprint over STABLE fields only (git commit/dirty churns across
+    # commits and would silently re-collect identical data under new names)
+    fp_meta = {k: v for k, v in meta.items() if k != "git"}
+    return ReplayBuffer.fingerprint_name(fp_meta, DATA_DIR), meta
 
 
 def collect_stage(stage: str, cfg: dict | None = None, log=print) -> dict:

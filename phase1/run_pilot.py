@@ -129,7 +129,9 @@ def screen_grid(train_arrays, val_arrays, pers_val_combined, log=print):
 
 
 def train_fused(gcfg: dict, lidar_leak: str, body_leak: str, fusion: bool,
-                rs: int, ms: int, arrays: dict, log=print) -> dict:
+                rs: int, ms: int, arrays: dict, log=print,
+                epochs: int | None = None, batch_size: int | None = None,
+                lr: float | None = None) -> dict:
     """One modular run with preregistered exclusion/regeneration rules."""
     exclusions = []
     seed_shift = 0
@@ -138,8 +140,9 @@ def train_fused(gcfg: dict, lidar_leak: str, body_leak: str, fusion: bool,
                               lidar_leak=lidar_leak, body_leak=body_leak,
                               fusion=fusion)
         info = train_modular(system, arrays["train"], arrays["val"],
-                             PILOT["epochs"], PILOT["batch_size"],
-                             PILOT["lr"], seed=ms, log=log)
+                             epochs or PILOT["epochs"],
+                             batch_size or PILOT["batch_size"],
+                             lr or PILOT["lr"], seed=ms, log=log)
         failed = (info["history"]["status"] != "ok"
                   or not info["health"]["lidar"]["ok"]
                   or not info["health"]["body"]["ok"])
